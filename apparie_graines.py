@@ -32,6 +32,9 @@ Usage (dans le dossier de borho4.py ; numpy, sympy, gmpy2) :
 Options : --u (u0, u2 <= u, defaut 1e5), --p0 (p >= p0, defaut 1e5), --K (D <= K*G^2, defaut 1e7),
   --budget (secondes max par G, defaut 60 ; les G coupes vont dans <out>.incomplets), --out
   (defaut apparie_cycles.txt ; les cycles deja dans --out ne sont pas reecrits).
+Filtres (sur toute source de G, avant --debut / --nombre) : --impairs (ecarte les G pairs), --hmin 1.85
+  (ecarte les G d'abondance plus basse), --exclure fichiers... (ecarte les G deja dans ces listes ou .faits).
+  Exemple : --depuis-paires c2_22.txt.gz --impairs --hmin 1.85 --exclure G_*.txt ag_*.txt.faits
 Reprise : chaque G termine (non coupe par le budget) est note dans <out>.faits avec les parametres du run
   (u, p0, K, maxp) ; relancer la meme commande saute les G deja faits avec ces parametres (--refaire pour
   les relancer ; un --G unique est toujours refait). Ctrl-C arrete proprement, l'avancement est garde.
@@ -53,6 +56,8 @@ import borho4 as B
 
 SIG = None          # table sigma(u), u <= U (heritee par les processus au fork)
 TRI = None          # (u, sigma(u), y = u/sigma(u)) tries par y, calcules une fois (herites au fork)
+PETITS = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47)
+MASQUES = {}        # q -> (u % q != 0) sur TRI[0], pour les petits premiers (herites au fork)
 
 
 def tri():
@@ -63,9 +68,14 @@ def tri():
         su = SIG[1:]
         y = u / su
         o = np.argsort(y, kind="stable")
-        del y
         ty = np.int32 if len(SIG) < 2 ** 31 and int(su.max()) < 2 ** 31 else np.int64   # 32 bits : memoire / 2
-        TRI = (u[o].astype(ty), su[o].astype(ty), (u / su)[o])
+        TRI = (u[o].astype(ty), su[o].astype(ty), y[o])   # y deja calcule : reordonne, pas recalcule
+        del y
+        # masques « u premier avec q » des petits premiers, une fois (partages par les processus au fork) :
+        # le filtrage par G ne refait plus un modulo sur tout le tableau pour chacun d'eux
+        MASQUES.clear()
+        for q in PETITS:
+            MASQUES[q] = (TRI[0] % q) != 0
     return TRI
 P = {}
 _LIB = None         # module C (libborho4c.so, fonction apparie_couples) ; False : Python pur
@@ -173,10 +183,14 @@ def _chercher(g):
     Ut, St, Yt = tri()
     ok = np.ones(len(Ut), dtype=bool)
     for q in G:
-        if q <= U:                                     # un premier > U ne divise aucun u <= U
+        if q in MASQUES:
+            ok &= MASQUES[q]                           # petit premier : masque precalcule
+        elif q <= U:                                   # un premier > U ne divise aucun u <= U
             ok &= (Ut % q) != 0                     # (et depasserait les entiers 32 bits)
-    Uu, Ss, Y = Ut[ok], St[ok], Yt[ok]                     # filtrer garde l'ordre des y
+    ix = np.flatnonzero(ok)                            # filtrer garde l'ordre des y
     del ok
+    Uu, Ss, Y = Ut.take(ix), St.take(ix), Yt.take(ix)
+    del ix
     Emax = int(K * Gv * Gv // S)
     if P.get("gpu") and Emax >= 1 << 63 and lib_gpu():
         # gros G (au-dela de ~1,7e12 pour K = 1e7) : le noyau GPU travaille avec E < 2^63. Plutot que de
@@ -483,10 +497,19 @@ def main():
     ap.add_argument("--maxp", type=int, default=2000, help="valeurs de p essayees par couple au-dessus du plus petit "
                     "possible (les cycles connus ont p tout pres de ce minimum ; 20 suffit presque toujours)")
     ap.add_argument("--jobs", type=int, default=1)
+    ap.add_argument("--recyclage", type=int, default=10, metavar="N",
+                    help="chaque processus est remplace apres N G (memoire rendue au systeme ; avec --gpu, chaque "
+                         "remplacement recharge CUDA) ; a augmenter si les G sont rapides (ex. 100)")
     ap.add_argument("--out", default="apparie_cycles.txt")
     ap.add_argument("--sans-c", action="store_true", help="tout en Python (verification, plus lent)")
     ap.add_argument("--connus", nargs="*", default=[])
     ap.add_argument("--refaire", action="store_true", help="refaire aussi les G deja notes dans <out>.faits")
+    ap.add_argument("--impairs", action="store_true", help="ecarter les G pairs")
+    ap.add_argument("--hmin", type=float, default=0, metavar="H",
+                    help="ecarter les G dont l'abondance sigma(G)/G est < H (ex. 1.85)")
+    ap.add_argument("--exclure", nargs="+", default=[], metavar="FICHIER",
+                    help="ecarter les G presents dans ces fichiers : listes de G (premier mot de chaque ligne) ou "
+                         "fichiers .faits (G apres la tabulation, QUELS QUE SOIENT les parametres du run)")
     ap.add_argument("--gpu", nargs="?", const="auto", default=None,
                     help="boucle des couples sur GPU (libapparie_gpu.so ; libapparie_cpu.so a defaut) ; "
                          "chemin de la bibliotheque en option. Conseille avec --jobs 1 ou 2")
@@ -512,8 +535,45 @@ def main():
         Gs = [g for g, _ in Gs]
     else:
         sys.exit("donner --G, --liste, --depuis-catalogue, --hors-catalogue ou --depuis-paires")
+    if args.impairs or args.hmin or args.exclure:
+        # filtres appliques AVANT --debut / --nombre (qui comptent donc dans la liste filtree) ; comparaison
+        # par valeur de G, insensible a l'ecriture (« 3^2*5 » et « 5*3^2 » sont le meme G)
+        exclus = set()
+        for f in args.exclure:
+            for l in open(f, encoding="utf-8", errors="replace"):
+                l = l.strip()
+                if not l or l.startswith("#"):
+                    continue
+                g = l.split("\t", 1)[1] if "\t" in l else l.split()[0]
+                try:
+                    exclus.add(B.val(B.parse(g)))
+                except ValueError:
+                    pass                               # ligne qui n'est pas un G : ignoree
+        n0, garde, ec = len(Gs), [], dict(pair=0, abondance=0, exclu=0)
+        for g in Gs:
+            f = B.parse(g)
+            if args.impairs and 2 in f:
+                ec["pair"] += 1
+            elif args.hmin and B.sig(f) < args.hmin * B.val(f):
+                ec["abondance"] += 1
+            elif B.val(f) in exclus:
+                ec["exclu"] += 1
+            else:
+                garde.append(g)
+        Gs = garde
+        print(f"filtres : {n0} G -> {len(Gs)} gardes (ecartes : {ec['pair']} pairs, {ec['abondance']} sous "
+              f"h = {args.hmin:g}, {ec['exclu']} deja dans {len(args.exclure)} fichier(s) exclus)", flush=True)
     Gs = Gs[args.debut:args.debut + args.nombre] if args.nombre else Gs[args.debut:]
-    Gs = list(dict.fromkeys(Gs))                           # un G en double dans la liste n'est fait qu'une fois
+    vus_g, uniques = set(), []                             # un G en double n'est fait qu'une fois, meme ecrit
+    for g in Gs:                                           # autrement (« 3^2*5*19 » et « 19*3^2*5 »)
+        try:
+            v = B.val(B.parse(g))
+        except ValueError:
+            v = g
+        if v not in vus_g:
+            vus_g.add(v)
+            uniques.append(g)
+    Gs = uniques
     # reprise : G termines avec les memes parametres (une ligne « parametres <tab> G » par G)
     f_faits = args.out + ".faits"
     cle = f"u={int(args.u)},p0={int(args.p0)},K={args.K:g},maxp={args.maxp}"
@@ -559,7 +619,8 @@ def main():
     deja_inc = {l.strip() for l in open(f_inc)} if os.path.exists(f_inc) else set()
     total = {}
     interrompu = False
-    pool = get_context("fork").Pool(max(1, args.jobs), initializer=init_processus, initargs=(params,), maxtasksperchild=10)
+    pool = get_context("fork").Pool(max(1, args.jobs), initializer=init_processus, initargs=(params,),
+                                  maxtasksperchild=max(1, args.recyclage))
     try:
         for k, (g, cyc, st) in enumerate(pool.imap_unordered(chercher, Gs), 1):
             nfaits = k
