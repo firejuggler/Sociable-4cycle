@@ -159,10 +159,51 @@ values, the CPU path may be used instead, and very large `G` values are progress
 
 ## 8. Practical advice (from experience)
 
-- prefer odd `G` with `sigma(G)/G` between `1.85` and `2`
-- small `G` are usually the fastest and most productive
-- use exact common parts of known cycles and nearby variants
-- a larger `--u` often pays off much more than a larger `--maxp`
+These recommendations reflect observed runs and the current implementation; they are practical
+heuristics, not mathematical guarantees.
+
+### Choosing G
+
+- Prefer odd `G`. Even values have not produced cycles in the runs so far.
+- A useful range is `1.85 <= sigma(G)/G < 2`. Below `1.85`, the yield has been roughly halved.
+- Smaller `G` values are generally both faster and more productive. A practical range is about `10^5`
+  to `10^8`, with smaller values preferred.
+- Start with exact common parts of known cycles and their one-change variants. Variants involving two
+  changes have yielded much less.
+- A ratio near `2` can make the number of candidate pairs explode. Values around `1.97` have been slow
+  or cut short by the time budget.
+
+### Size and arithmetic limits
+
+- Above about `1.7 · 10^12`, the GPU has to bound `E` (the `emax_borne` statistic). The search is then
+  incomplete, and that `G` is not marked as completed.
+- Above `2^44 ≈ 1.76 · 10^13`, or when `sigma(G) > 2^46`, the GPU kernel rejects `G` and the CPU C
+  path is used instead; this can be about 100 times slower.
+- With `u = 10^7`, `G` above `10^12` is generally not worthwhile: runs tend to hit the 600-second
+  budget without finding a cycle. For example, 36 budget-cut values ranged from `1.8 · 10^13` to
+  `2 · 10^14`.
+
+### Choosing `u`
+
+| `u` | Practical range for `G` |
+|---:|---|
+| `10^6` | Values up to `10^12` are generally fast. |
+| `10^7` | Prefer `G < 10^12`; larger values are usually not worthwhile. |
+| `3 · 10^7` | Prefer `G < 10^6`; values up to `10^7` may be worth trying. |
+
+The number of candidate pairs grows roughly as `u^2` and also increases with `G`, so the time per `G`
+can rise quickly as either grows.
+
+### Suggested default filters
+
+For candidate lists, a reasonable starting point is odd `G` with
+`1.85 <= sigma(G)/G < 1.96`, `G < 10^12` when `u = 10^7`, and `G < 10^7` when `u = 3 · 10^7`.
+The upper ratio cutoff of `1.96` is tentative, not an established limit: two `G` values with ratio
+`1.971` were slow, but it is not yet known whether they would have produced cycles if allowed to run
+longer. Keeping values up to `2` is also reasonable if the available time budget permits it.
+
+A larger `--u` often pays off much more than a larger `--maxp`, but its cost grows quickly; choose it
+with the size of `G` in mind.
 
 ## 9. Checking a cycle independently
 
