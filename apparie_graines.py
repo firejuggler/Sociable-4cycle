@@ -39,6 +39,9 @@ Reprise : chaque G termine (non coupe par le budget) est note dans <out>.faits a
   (u, p0, K, maxp) ; relancer la meme commande saute les G deja faits avec ces parametres (--refaire pour
   les relancer ; un --G unique est toujours refait). Ctrl-C arrete proprement, l'avancement est garde.
   Un G qui provoque une erreur n'arrete plus le run : il est note dans <out>.erreurs.
+Boucle des couples : --gpu (libapparie_gpu.so) ; sans --gpu, libapparie_cpu.so (OpenMP, compilee au besoin
+  depuis apparie_gpu.cu, coeurs partages entre les --jobs) est utilisee par defaut : meme calcul que le
+  module C, plusieurs fois plus rapide. --sans-noyau : chemin C habituel (controle).
 """
 import c2io                     # lecture des c2_* : .txt, .gz et .gz « factorisation seule »
 import argparse
@@ -56,6 +59,8 @@ import borho4 as B
 
 SIG = None          # table sigma(u), u <= U (heritee par les processus au fork)
 TRI = None          # (u, sigma(u), y = u/sigma(u)) tries par y, calcules une fois (herites au fork)
+PETITS = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47)
+MASQUES = {}        # q -> (u % q != 0) sur TRI[0], pour les petits premiers (herites au fork)
 
 
 def tri():
@@ -66,9 +71,14 @@ def tri():
         su = SIG[1:]
         y = u / su
         o = np.argsort(y, kind="stable")
-        del y
         ty = np.int32 if len(SIG) < 2 ** 31 and int(su.max()) < 2 ** 31 else np.int64   # 32 bits : memoire / 2
-        TRI = (u[o].astype(ty), su[o].astype(ty), (u / su)[o])
+        TRI = (u[o].astype(ty), su[o].astype(ty), y[o])   # y deja calcule : reordonne, pas recalcule
+        del y
+        # masques « u premier avec q » des petits premiers, une fois (partages par les processus au fork) :
+        # le filtrage par G ne refait plus un modulo sur tout le tableau pour chacun d'eux
+        MASQUES.clear()
+        for q in PETITS:
+            MASQUES[q] = (TRI[0] % q) != 0
     return TRI
 P = {}
 _LIB = None         # module C (libborho4c.so, fonction apparie_couples) ; False : Python pur
@@ -103,10 +113,37 @@ def lib_c():
     return _LIB
 
 
-_GPU = None        # libapparie_gpu.so (ou libapparie_cpu.so) ; False : absent
+_GPU = None        # (bibliotheque, chemin) : libapparie_gpu.so ou libapparie_cpu.so ; False : absente
+
+
+def compiler_cpu(verbeux=False):
+    """libapparie_cpu.so (boucle des couples sur CPU, OpenMP), compilee depuis apparie_gpu.cu si elle manque
+    ou est plus ancienne que la source (comme libborho4c.so). Renvoie son chemin, ou None."""
+    import subprocess
+    ici = os.path.dirname(os.path.abspath(__file__))
+    src, so = os.path.join(ici, "apparie_gpu.cu"), os.path.join(ici, "libapparie_cpu.so")
+    if os.path.isfile(so) and (not os.path.isfile(src) or os.path.getmtime(so) >= os.path.getmtime(src)):
+        return so
+    if not os.path.isfile(src):
+        return None
+    cmd = ["g++", "-O3", "-fopenmp", "-fPIC", "-shared", "-x", "c++", "-o", so + ".tmp", src]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as ex:
+        r = None
+        err = str(ex)
+    if r is not None and r.returncode == 0:
+        os.replace(so + ".tmp", so)
+        return so
+    if verbeux:
+        err = (r.stderr.strip().splitlines()[-1:] or ["?"])[0] if r is not None else err
+        print(f"[i] compilation de libapparie_cpu.so impossible ({err}) : chemin C habituel", flush=True)
+    return so if os.path.isfile(so) else None
 
 
 def lib_gpu():
+    """Boucle rapide des couples. P["gpu"] : chemin d'une bibliotheque, "auto" (--gpu : libapparie_gpu.so,
+    sinon libapparie_cpu.so), "cpu" (defaut sans --gpu : libapparie_cpu.so, compilee au besoin) ou None."""
     global _GPU
     if _GPU is None:
         _GPU = False
@@ -114,9 +151,14 @@ def lib_gpu():
         if nom:
             import ctypes
             ici = os.path.dirname(os.path.abspath(__file__))
-            for c in ([nom] if nom != "auto" else []) + [os.path.join(ici, "libapparie_gpu.so"),
-                                                         os.path.join(ici, "libapparie_cpu.so")]:
-                if os.path.isfile(c):
+            if nom == "cpu":
+                cands = [compiler_cpu()]
+            elif nom == "auto":
+                cands = [os.path.join(ici, "libapparie_gpu.so"), compiler_cpu()]
+            else:
+                cands = [nom]
+            for c in cands:
+                if c and os.path.isfile(c):
                     L = ctypes.CDLL(c)
                     i64, u64, ip = ctypes.c_int64, ctypes.c_uint64, ctypes.c_void_p
                     L.ag_charger.argtypes = [ip, ip, ctypes.c_int, ip, ip, ip, ctypes.c_int, i64, i64, u64, u64,
@@ -126,7 +168,13 @@ def lib_gpu():
                                           ctypes.POINTER(ctypes.c_ulonglong)]
                     L.ag_scan.restype = ctypes.c_int
                     L.ag_liberer.restype = None
-                    _GPU = (L, c)
+                    fils = getattr(L, "ag_fils", None)     # version CPU : coeurs partages entre les --jobs
+                    if fils is not None and P.get("fils"):
+                        fils.argtypes = [ctypes.c_int]
+                        fils.restype = None
+                        fils(int(P["fils"]))
+                    vrai = fils is None and "cpu" not in os.path.basename(c)   # ancienne version CPU : sans ag_fils
+                    _GPU = (L, c, vrai)                     # (bibliotheque, chemin, vrai GPU ?)
                     break
     return _GPU
 
@@ -176,12 +224,17 @@ def _chercher(g):
     Ut, St, Yt = tri()
     ok = np.ones(len(Ut), dtype=bool)
     for q in G:
-        if q <= U:                                     # un premier > U ne divise aucun u <= U
+        if q in MASQUES:
+            ok &= MASQUES[q]                           # petit premier : masque precalcule
+        elif q <= U:                                   # un premier > U ne divise aucun u <= U
             ok &= (Ut % q) != 0                     # (et depasserait les entiers 32 bits)
-    Uu, Ss, Y = Ut[ok], St[ok], Yt[ok]                     # filtrer garde l'ordre des y
+    ix = np.flatnonzero(ok)                            # filtrer garde l'ordre des y
     del ok
+    Uu, Ss, Y = Ut.take(ix), St.take(ix), Yt.take(ix)
+    del ix
     Emax = int(K * Gv * Gv // S)
-    if P.get("gpu") and Emax >= 1 << 63 and lib_gpu():
+    if P.get("gpu") not in (None, "cpu") and Emax >= 1 << 63 and lib_gpu():
+        # (seulement avec --gpu explicite : par defaut, ces G restent sur le chemin C, sans borne)
         # gros G (au-dela de ~1,7e12 pour K = 1e7) : le noyau GPU travaille avec E < 2^63. Plutot que de
         # passer tout le G sur CPU (des minutes), on borne E a 2^63 - 1 : D <= S * (2^63 - 1) au lieu de K G^2.
         Emax = (1 << 63) - 1
@@ -274,7 +327,7 @@ def _chercher(g):
                 and Emax < 1 << 63 and tot > 0)
         if dans:
             Lg = gp[0]
-            st["gpu"] = 1
+            st["gpu" if gp[2] else "noyau_cpu"] = 1
             a_U = np.ascontiguousarray(Uu, dtype=np.int64); a_S = np.ascontiguousarray(Ss, dtype=np.int64)
             a_jx = np.ascontiguousarray(jx, dtype=np.int32); a_lo = np.ascontiguousarray(lo, dtype=np.int32)
             a_cs = np.ascontiguousarray(np.cumsum(n, dtype=np.int64))
@@ -305,11 +358,10 @@ def _chercher(g):
                         raise RuntimeError(f"ag_scan : code {r}")
                     nt_gpu += ntg.value
                     n2_gpu += n2g.value
-                    plein = [k for k in range(r) if op[k] == 0]     # hors domaine : couple entier en C
-                    if plein:
-                        for u0, s0, u2, s2, p in appel(np.array([oi[k] for k in plein]), np.array([oj[k] for k in plein])):
-                            cyc += cycles_de(G, Gv, S, u0, s0, u2, s2, p)
                     m_ = op[:r] != 0                       # (u0, u2, p) refaits en C, chacun avec son p
+                    if not m_.all():                       # p = 0 : hors domaine, couple entier en C
+                        for u0, s0, u2, s2, p in appel(oi[:r][~m_].copy(), oj[:r][~m_].copy()):
+                            cyc += cycles_de(G, Gv, S, u0, s0, u2, s2, p)
                     n_unit += int(m_.sum())
                     for u0, s0, u2, s2, p in appel_p(oi[:r][m_].copy(), oj[:r][m_].copy(), op[:r][m_].copy()):
                         cyc += cycles_de(G, Gv, S, u0, s0, u2, s2, p)
@@ -322,7 +374,7 @@ def _chercher(g):
             st["th2"], st["premiers"] = n2_gpu + int(sts[1]) - n_unit, int(sts[2])
             st["hors_64_bits"] = int(sts[3])
             st["th1_C_aucun_d1"], st["th1_C_ok"], st["th1_C_trop_div"], st["th1_Python"] = (int(sts[4]), int(sts[5]),
-                                                                                          int(sts[6]), int(sts[7]))
+                                                                                         int(sts[6]), int(sts[7]))
             return g, cyc, st
         for d, ii, jj in ((d, I_[d:d + 4096], J_[d:d + 4096]) for I_, J_ in paquets() for d in range(0, len(I_), 4096)):
             if budget and time.time() - t0 > budget:
@@ -333,7 +385,7 @@ def _chercher(g):
         st["p_testes"], st["th2"], st["premiers"] = int(sts[0]), int(sts[1]), int(sts[2])
         st["hors_64_bits"] = int(sts[3])
         st["th1_C_aucun_d1"], st["th1_C_ok"], st["th1_C_trop_div"], st["th1_Python"] = (int(sts[4]), int(sts[5]),
-                                                                                      int(sts[6]), int(sts[7]))
+                                                                                     int(sts[6]), int(sts[7]))
         return g, cyc, st
     for k, (i, j) in enumerate((i, j) for I_, J_ in paquets() for i, j in zip(I_.tolist(), J_.tolist())):
         if budget and k % 256 == 0 and time.time() - t0 > budget:
@@ -483,8 +535,12 @@ def main():
     ap.add_argument("--p0", type=float, default=1e5)
     ap.add_argument("--K", type=float, default=1e7)
     ap.add_argument("--budget", type=float, default=60)
-    ap.add_argument("--maxp", type=int, default=2000, help="valeurs de p essayees par couple au-dessus du plus petit possible (les cycles connus ont p tout pres de ce minimum ; 20 suffit presque toujours)")
+    ap.add_argument("--maxp", type=int, default=2000, help="valeurs de p essayees par couple au-dessus du plus petit "
+                    "possible (les cycles connus ont p tout pres de ce minimum ; 20 suffit presque toujours)")
     ap.add_argument("--jobs", type=int, default=1)
+    ap.add_argument("--recyclage", type=int, default=10, metavar="N",
+                    help="chaque processus est remplace apres N G (memoire rendue au systeme ; avec --gpu, chaque "
+                         "remplacement recharge CUDA) ; a augmenter si les G sont rapides (ex. 100)")
     ap.add_argument("--out", default="apparie_cycles.txt")
     ap.add_argument("--sans-c", action="store_true", help="tout en Python (verification, plus lent)")
     ap.add_argument("--connus", nargs="*", default=[])
@@ -493,9 +549,14 @@ def main():
     ap.add_argument("--hmin", type=float, default=0, metavar="H",
                     help="ecarter les G dont l'abondance sigma(G)/G est < H (ex. 1.85)")
     ap.add_argument("--exclure", nargs="+", default=[], metavar="FICHIER",
-                    help="ecarter les G presents dans ces fichiers : listes de G (premier mot de chaque ligne) ou fichiers .faits (G apres la tabulation, QUELS QUE SOIENT les parametres du run)")
+                    help="ecarter les G presents dans ces fichiers : listes de G (premier mot de chaque ligne) ou "
+                         "fichiers .faits (G apres la tabulation, QUELS QUE SOIENT les parametres du run)")
     ap.add_argument("--gpu", nargs="?", const="auto", default=None,
-                    help="boucle des couples sur GPU (libapparie_gpu.so ; libapparie_cpu.so a defaut) ; chemin de la bibliotheque en option. Conseille avec --jobs 1 ou 2")
+                    help="boucle des couples sur GPU (libapparie_gpu.so ; libapparie_cpu.so a defaut) ; "
+                         "chemin de la bibliotheque en option. Conseille avec --jobs 1 ou 2")
+    ap.add_argument("--sans-noyau", action="store_true",
+                    help="ne pas utiliser la boucle rapide libapparie_cpu.so (utilisee par defaut sans --gpu) : "
+                         "chemin C habituel, pour controle")
     args = ap.parse_args()
     if args.G:
         Gs = [args.G]
@@ -518,19 +579,20 @@ def main():
         Gs = [g for g, _ in Gs]
     else:
         sys.exit("donner --G, --liste, --depuis-catalogue, --hors-catalogue ou --depuis-paires")
-
-    # chasse aux G auto-generes de ce run, ne pas les exclure eux-memes
-    auto_files = {os.path.abspath(x) for x in [
-        "G_catalogue.txt", "G_hors_catalogue.txt", "G_paires.txt",
-        args.out, args.out + ".faits", args.out + ".incomplets", args.out + ".erreurs",
-        args.liste or "",
-    ] if x}
-
     if args.impairs or args.hmin or args.exclure:
+        # filtres appliques AVANT --debut / --nombre (qui comptent donc dans la liste filtree) ; comparaison
+        # par valeur de G, insensible a l'ecriture (« 3^2*5 » et « 5*3^2 » sont le meme G)
         exclus = set()
+        # fichiers ecrits par CE run (liste des G tiree de la source) : jamais pris comme exclusion, sinon
+        # tous les G s'excluraient eux-memes (ex. --depuis-paires ... --exclure G_*.txt, qui contient G_paires.txt)
+        ecrits = {os.path.abspath(n) for n, oui in (("G_paires.txt", args.depuis_paires),
+                                                     ("G_catalogue.txt", args.depuis_catalogue),
+                                                     ("G_hors_catalogue.txt", args.hors_catalogue)) if oui}
+        if args.liste:
+            ecrits.add(os.path.abspath(args.liste))
         for f in args.exclure:
-            if os.path.abspath(f) in auto_files:
-                print(f"[i] --exclure ignore {f} (fichier genere par ce run)", flush=True)
+            if os.path.abspath(f) in ecrits:
+                print(f"[i] --exclure : {f} ignore (c'est la liste de G de ce run)", flush=True)
                 continue
             for l in open(f, encoding="utf-8", errors="replace"):
                 l = l.strip()
@@ -540,13 +602,13 @@ def main():
                 try:
                     exclus.add(B.val(B.parse(g)))
                 except ValueError:
-                    pass
+                    pass                               # ligne qui n'est pas un G : ignoree
         n0, garde, ec = len(Gs), [], dict(pair=0, abondance=0, exclu=0)
         for g in Gs:
             f = B.parse(g)
             if args.impairs and 2 in f:
                 ec["pair"] += 1
-            elif args.hmin and B.sig(f) / B.val(f) < args.hmin:
+            elif args.hmin and B.sig(f) < args.hmin * B.val(f):
                 ec["abondance"] += 1
             elif B.val(f) in exclus:
                 ec["exclu"] += 1
@@ -554,22 +616,18 @@ def main():
                 garde.append(g)
         Gs = garde
         print(f"filtres : {n0} G -> {len(Gs)} gardes (ecartes : {ec['pair']} pairs, {ec['abondance']} sous "
-              f"h = {args.hmin:g}, {ec['exclu']} deja dans {len(args.exclure)} fichier(s) exclus)", flush=True)
-
+              f"h = {args.hmin:g}, {ec['exclu']} deja dans les fichiers exclus)", flush=True)
     Gs = Gs[args.debut:args.debut + args.nombre] if args.nombre else Gs[args.debut:]
-
-    seen_values = set()
-    uniques = []
-    for g in Gs:
+    vus_g, uniques = set(), []                             # un G en double n'est fait qu'une fois, meme ecrit
+    for g in Gs:                                           # autrement (« 3^2*5*19 » et « 19*3^2*5 »)
         try:
             v = B.val(B.parse(g))
         except ValueError:
             v = g
-        if v not in seen_values:
-            seen_values.add(v)
+        if v not in vus_g:
+            vus_g.add(v)
             uniques.append(g)
     Gs = uniques
-
     # reprise : G termines avec les memes parametres (une ligne « parametres <tab> G » par G)
     f_faits = args.out + ".faits"
     cle = f"u={int(args.u)},p0={int(args.p0)},K={args.K:g},maxp={args.maxp}"
@@ -599,14 +657,24 @@ def main():
     SIG = None                                             # plus utile : la table triee suffit
     print(f"{len(Gs)} partie(s) commune(s) ; u0, u2 <= {U:g}, p >= {args.p0:g}, D <= {args.K:g} G^2 ; "
           f"table sigma {time.time() - t0:.0f} s", flush=True)
+    # boucle rapide des couples : --gpu, sinon libapparie_cpu.so par defaut (meme calcul que le chemin C,
+    # ~4 fois plus rapide par coeur) ; --sans-noyau ou --sans-c : chemin C habituel (controle)
+    mode = None if (args.sans_noyau or args.sans_c) else (args.gpu or "cpu")
+    try:
+        ncoeurs = len(os.sched_getaffinity(0))
+    except AttributeError:
+        ncoeurs = os.cpu_count() or 1
     params = dict(U=U, P0=int(args.p0), K=args.K, budget=args.budget, sans_c=args.sans_c, maxp=args.maxp,
-                  gpu=args.gpu)
+                  gpu=mode, fils=max(1, ncoeurs // max(1, args.jobs)))
     P["sans_c"] = args.sans_c
     print("[i] module C : " + ("oui" if lib_c() else "non (Python pur, plus lent)"), flush=True)
-    if args.gpu:
-        P["gpu"] = args.gpu
+    if mode:
+        P["gpu"] = mode
+        if mode == "cpu":
+            compiler_cpu(verbeux=True)                     # une fois, avant le fork
         gp = lib_gpu()
-        print("[i] boucle des couples : " + (os.path.basename(gp[1]) if gp else "bibliotheque introuvable, module C seul"),
+        print("[i] boucle des couples : " + (os.path.basename(gp[1]) + ("" if gp[2] else f", {params['fils']} fil(s) "
+                                             "par processus") if gp else "bibliotheque introuvable, module C seul"),
               flush=True)
         globals()["_GPU"] = None                           # rechargee dans chaque processus (CUDA apres fork)
     init(params)
@@ -615,7 +683,8 @@ def main():
     deja_inc = {l.strip() for l in open(f_inc)} if os.path.exists(f_inc) else set()
     total = {}
     interrompu = False
-    pool = get_context("fork").Pool(max(1, args.jobs), initializer=init_processus, initargs=(params,), maxtasksperchild=10)
+    pool = get_context("fork").Pool(max(1, args.jobs), initializer=init_processus, initargs=(params,),
+                                  maxtasksperchild=max(1, args.recyclage))
     try:
         for k, (g, cyc, st) in enumerate(pool.imap_unordered(chercher, Gs), 1):
             nfaits = k

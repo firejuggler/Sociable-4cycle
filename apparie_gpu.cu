@@ -20,6 +20,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(_OPENMP) && !defined(__CUDACC__)
+#include <omp.h>
+#endif
 
 typedef __int128 i128;
 typedef unsigned __int128 u128;
@@ -67,8 +70,14 @@ HD int ctz64(uint64_t x) {                         // x != 0
 }
 
 HD uint64_t ninv64(uint64_t n) {                   // -1/n mod 2^64, n impair (Newton, sans division)
+    // variante de Dumas : y = 1 - n*x est eleve au carre en parallele des produits x*(1 + y), d'ou une
+    // chaine de dependances plus courte que Newton (meme nombre de multiplications)
     uint64_t x = (3 * n) ^ 2;                      // 5 bits justes
-    x *= 2 - n * x; x *= 2 - n * x; x *= 2 - n * x; x *= 2 - n * x;
+    uint64_t y = 1 - n * x;
+    x *= 1 + y; y *= y;                            // 10 bits
+    x *= 1 + y; y *= y;                            // 20 bits
+    x *= 1 + y; y *= y;                            // 40 bits
+    x *= 1 + y;                                    // 80 bits
     return 0 - x;
 }
 
@@ -119,8 +128,28 @@ HD uint64_t un_couple(int64_t G, int64_t S, int64_t u0, int64_t s0, int64_t u2, 
         a = (uint64_t)al;
         // pmin = max(floor(nb/a) + 1, P0) : le plus souvent P0 (un produit suffit), sinon division 64 bits si possible
         if ((u128)a * P0 > nb) pmin = P0;
-        else if ((nb >> 64) == 0) pmin = (uint64_t)nb / a + 1;     // > P0 ici ; pas de depassement (nb >= a*P0)
-        else {
+        else if ((nb >> 64) == 0) {
+            // pmin = nb/a + 1 (> P0 ici). Quotient estime en flottant (erreur < 1 pour q < 2^50) puis corrige
+            // exactement : plus rapide que la division 64 bits, faite pour CHAQUE couple. Le reste r donne
+            // directement E0 = a*pmin + be = a - r, d'ou le rejet E0 > Emax (73 % des couples) sans multiplication.
+            // (Sur GPU : division entiere, le fp64 des cartes grand public est trop lent ; le rejet par le
+            // reste reste valable.)
+            uint64_t n64 = (uint64_t)nb, q, r;
+#ifdef __CUDA_ARCH__
+            q = n64 / a; r = n64 - q * a;
+#else
+            double qd = (double)n64 / (double)a;
+            if (qd < 1125899906842624.0) {                         // 2^50 : erreur de l'estimation < 1
+                q = (uint64_t)qd;
+                i128 rr = (i128)n64 - (i128)((u128)q * a);
+                while (rr < 0) { q--; rr += a; }
+                while (rr >= (i128)a) { q++; rr -= a; }
+                r = (uint64_t)rr;
+            } else { q = n64 / a; r = n64 - q * a; }
+#endif
+            if (a - r > Emax) return 0;                            // E0 = a - r > Emax : aucun p
+            pmin = q + 1;
+        } else {
             u128 t = nb / a + 1;
             if (t >> 64) return 0;                                 // C : stats[3] (hors 64 bits), saute
             pmin = (uint64_t)t;
@@ -180,6 +209,8 @@ static int64_t hG, hS; static uint64_t hP0, hmaxp, hEmax; static int hnw;
 
 #ifdef __CUDACC__
 
+#define TUILE ((int64_t)32 * 64)                 // couples par tuile de warp (64 par fil)
+
 static int64_t *dU, *dS, *dcs; static int32_t *djx, *dlo; static Sortie *dout; static int *dno;
 static unsigned long long *dnt, *dn2; static int dcap = 0;
 
@@ -187,16 +218,27 @@ __global__ void k_scan(int64_t t0, int64_t t1, const int64_t *U, const int64_t *
                        const int32_t *lo, const int64_t *cs, int nw, int64_t G, int64_t S, uint64_t P0,
                        uint64_t maxp, uint64_t Emax, Sortie *out, int cap, int *no, unsigned long long *nt,
                        unsigned long long *n2) {
+    // Chaque warp traite des tuiles de TUILE couples consecutifs ; le fil l prend t = b + l, b + l + 32, ...
+    // (32 fils voisins sur des couples voisins : lectures groupees). La fenetre n'est cherchee qu'une fois
+    // par fil et par tuile (au lieu d'une recherche dichotomique par couple), puis avancee lineairement.
     uint64_t loc = 0, loc2 = 0;
-    for (int64_t t = t0 + blockIdx.x * (int64_t)blockDim.x + threadIdx.x; t < t1;
-         t += (int64_t)gridDim.x * blockDim.x) {
+    const int lane = threadIdx.x & 31;
+    const int64_t warp = (blockIdx.x * (int64_t)blockDim.x + threadIdx.x) >> 5;
+    const int64_t nwarps = ((int64_t)gridDim.x * blockDim.x) >> 5;
+    for (int64_t b = t0 + warp * TUILE; b < t1; b += nwarps * TUILE) {
+        int64_t fin = b + TUILE < t1 ? b + TUILE : t1;
+        int64_t t = b + lane;
+        if (t >= fin) continue;
         int w = fenetre(cs, nw, t);
         int64_t base = w ? cs[w - 1] : 0;
-        int i = lo[w] + (int)(t - base), j = jx[w];
-        loc += un_couple(G, S, U[i], Sg[i], U[j], Sg[j], P0, maxp, Emax, &loc2, [&](uint64_t p) {
-            int k = atomicAdd(no, 1);
-            if (k < cap) { out[k].i = i; out[k].j = j; out[k].p = p; }
-        });
+        for (; t < fin; t += 32) {
+            while (t >= cs[w]) base = cs[w++];
+            int i = lo[w] + (int)(t - base), j = jx[w];
+            loc += un_couple(G, S, U[i], Sg[i], U[j], Sg[j], P0, maxp, Emax, &loc2, [&](uint64_t p) {
+                int k = atomicAdd(no, 1);
+                if (k < cap) { out[k].i = i; out[k].j = j; out[k].p = p; }
+            });
+        }
     }
     atomicAdd(nt, (unsigned long long)loc);
     atomicAdd(n2, (unsigned long long)loc2);
@@ -227,7 +269,9 @@ extern "C" int ag_scan(int64_t t0, int64_t t1, int32_t *oi, int32_t *oj, uint64_
     CK(cudaMemset(dno, 0, sizeof(int))); CK(cudaMemset(dnt, 0, sizeof(unsigned long long)));
     CK(cudaMemset(dn2, 0, sizeof(unsigned long long)));
     int64_t m = t1 - t0;
-    int nb = (int)((m + 255) / 256); if (nb > 65536) nb = 65536; if (nb < 1) nb = 1;
+    // blocs de 256 fils = 8 warps = 8 tuiles par tour de grille
+    int64_t nb64 = (m + 8 * TUILE - 1) / (8 * TUILE);
+    int nb = nb64 > 65536 ? 65536 : (nb64 < 1 ? 1 : (int)nb64);
     k_scan<<<nb, 256>>>(t0, t1, dU, dS, djx, dlo, dcs, hnw, hG, hS, hP0, hmaxp, hEmax, dout, dcap, dno, dnt, dn2);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
     int no; unsigned long long nt;
@@ -265,19 +309,27 @@ extern "C" int ag_scan(int64_t t0, int64_t t1, int32_t *oi, int32_t *oj, uint64_
                        unsigned long long *nth2) {
     int no = 0;
     unsigned long long nt = 0, n2 = 0;
-    #pragma omp parallel for schedule(dynamic, 4096) reduction(+:nt, n2)
-    for (int64_t t = t0; t < t1; t++) {
-        int w = fenetre(ccs, hnw, t);
+    // blocs de BLOC couples consecutifs : la fenetre (u2) n'est cherchee qu'une fois par bloc, puis avancee
+    // lineairement (une fenetre compte en moyenne des centaines de couples) ; le couple (u0, u2) est lu
+    // avec u2 et sigma(u2) gardes d'un couple a l'autre
+    const int64_t BLOC = 4096;
+    #pragma omp parallel for schedule(dynamic, 1) reduction(+:nt, n2)
+    for (int64_t b = t0; b < t1; b += BLOC) {
+        int64_t fin = b + BLOC < t1 ? b + BLOC : t1;
+        int w = fenetre(ccs, hnw, b);
         int64_t base = w ? ccs[w - 1] : 0;
-        int i = clo[w] + (int)(t - base), j = cjx[w];
-        uint64_t l2 = 0;
-        nt += un_couple(hG, hS, cU[i], cS[i], cU[j], cS[j], hP0, hmaxp, hEmax, &l2, [&](uint64_t p) {
-            int k;
-            #pragma omp atomic capture
-            k = no++;
-            if (k < ccap) { oi[k] = i; oj[k] = j; op[k] = p; }
-        });
-        n2 += l2;
+        for (int64_t t = b; t < fin; t++) {
+            while (t >= ccs[w]) base = ccs[w++];
+            int i = clo[w] + (int)(t - base), j = cjx[w];
+            uint64_t l2 = 0;
+            nt += un_couple(hG, hS, cU[i], cS[i], cU[j], cS[j], hP0, hmaxp, hEmax, &l2, [&](uint64_t p) {
+                int k;
+                #pragma omp atomic capture
+                k = no++;
+                if (k < ccap) { oi[k] = i; oj[k] = j; op[k] = p; }
+            });
+            n2 += l2;
+        }
     }
     *ntest = nt;
     *nth2 = n2;
@@ -285,5 +337,15 @@ extern "C" int ag_scan(int64_t t0, int64_t t1, int32_t *oi, int32_t *oj, uint64_
 }
 
 extern "C" void ag_liberer(void) {}
+
+// nombre de fils OpenMP de ce processus (apparie_graines.py : coeurs / --jobs, sans quoi chaque processus
+// prendrait tous les coeurs)
+extern "C" void ag_fils(int n) {
+#ifdef _OPENMP
+    if (n > 0) omp_set_num_threads(n);
+#else
+    (void)n;
+#endif
+}
 
 #endif
