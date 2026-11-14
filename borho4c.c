@@ -881,14 +881,61 @@ static inline int ac_divise(const mp_limb_t *m, int n, unsigned long E) {
         if (m[0] & ((E & -E) - 1)) return 0;
         E >>= __builtin_ctzl(E);
     }
-    unsigned long inv = (3 * E) ^ 2;                     /* 5 bits exacts, doubles a chaque pas */
-    inv *= 2 - E * inv; inv *= 2 - E * inv; inv *= 2 - E * inv; inv *= 2 - E * inv;
+    /* inverse de E mod 2^64 (variante de Dumas : y = 1 - E*inv eleve au carre en parallele des produits,
+       chaine de dependances plus courte que Newton, meme nombre de multiplications) */
+    unsigned long inv = (3 * E) ^ 2, y = 1 - E * inv;   /* 5 bits exacts, doubles a chaque pas */
+    inv *= 1 + y; y *= y; inv *= 1 + y; y *= y; inv *= 1 + y; y *= y; inv *= 1 + y;
     unsigned long c = 0;
     for (int i = 0; i < n; i++) {
         unsigned long x = m[i], l = x - c;
         c = (unsigned long)(((unsigned __int128)(l * inv) * E) >> 64) + (x < c);
     }
     return c == 0 || c == E;
+}
+
+/* E | M0 pour 2^64 <= E < 2^128 (E = eh*2^64 + el ; gros G, --depuis-paires), sans GMP : division exacte de
+   Hensel par un diviseur de deux mots. Apres retrait de la puissance de 2 (E1 impair), chaque pas annule le
+   mot de poids faible de r = M0 - Q*E1 (q = r[i] / el1 mod 2^64) ; apres n - 2 pas, r = R * 2^(64(n-2)) avec
+   -E1 < R < 2^128, et E1 | M0 <=> E1 | R (E1 impair) : un seul reste 128 bits a la fin. Verifie contre
+   mpz_divisible_p (test_ac_divise2.c). Renvoie -1 si M0 est trop long (le test GMP reprend). */
+#define AC2_MAX 32
+static inline int ac_divise2(const mp_limb_t *m, int n, unsigned long el, unsigned long eh) {
+    if (n == 0) return 1;                                /* M0 = 0 */
+    if (n > AC2_MAX) return -1;
+    unsigned __int128 E1 = ((unsigned __int128)eh << 64) | el;
+    if (!(el & 1)) {                                     /* 2^k | E : 2^k | M0 exige, puis E1 = E / 2^k */
+        int k = el ? __builtin_ctzl(el) : 64 + __builtin_ctzl(eh);
+        if (k < 64) { if (m[0] & ((1UL << k) - 1)) return 0; }
+        else {
+            if (m[0] || n < 2) return 0;
+            if (k > 64 && (m[1] & ((1UL << (k - 64)) - 1))) return 0;
+        }
+        E1 >>= k;
+    }
+    unsigned long e0 = (unsigned long)E1, e1 = (unsigned long)(E1 >> 64);
+    if (e1 == 0) return ac_divise(m, n, e0);             /* E1 tient sur un mot */
+    if (n < 2) return 0;                                 /* 0 < M0 < 2^64 <= E1 */
+    unsigned long inv = (3 * e0) ^ 2, y = 1 - e0 * inv;  /* 1 / e0 mod 2^64 (Dumas) */
+    inv *= 1 + y; y *= y; inv *= 1 + y; y *= y; inv *= 1 + y; y *= y; inv *= 1 + y;
+    unsigned long r[AC2_MAX];
+    for (int i = 0; i < n; i++) r[i] = m[i];
+    for (int i = 0; i + 2 < n; i++) {
+        unsigned long q = r[i] * inv;                    /* q*e0 = r[i] (mod 2^64) : le mot i s'annule */
+        unsigned __int128 a = (unsigned __int128)q * e0, b = (unsigned __int128)q * e1;
+        unsigned __int128 s = (a >> 64) + b;             /* a soustraire a partir du mot i+1 (< 2^128) */
+        unsigned long s0 = (unsigned long)s, s1 = (unsigned long)(s >> 64);
+        unsigned long t = r[i + 1];
+        r[i + 1] = t - s0;
+        unsigned long br = t < s0;
+        t = r[i + 2];
+        unsigned long d = t - s1, br2 = t < s1;
+        r[i + 2] = d - br;
+        br2 |= d < br;
+        for (int j = i + 3; br2 && j < n; j++) { br2 = r[j] == 0; r[j]--; }
+        if (br2) return 0;                               /* r < 0 : R < 0 et R > -E1, donc E1 ne divise pas */
+    }
+    unsigned __int128 R = ((unsigned __int128)r[n - 1] << 64) | r[n - 2];
+    return R % E1 == 0;
 }
 #else
 #define AC_EN_LIGNE 0
@@ -912,43 +959,80 @@ static int ac_impl(const char *Gfac, const char *Ss, int n, const long *u0, cons
     bx.k = by.k = 0; bx.retires = by.retires = 0;
     int ret = 0;
     for (int k = 0; k < n && ret >= 0; k++) {
-        mpz_mul_si(al, G, s0[k]); mpz_mul_si(al, al, u2[k]);
-        mpz_mul_si(t, G, s2[k]); mpz_mul_si(t, t, u0[k]); mpz_add(al, al, t);
-        mpz_mul_si(t, S, s0[k]); mpz_mul_si(t, t, s2[k]); mpz_sub(al, al, t);
-        mpz_mul_si(be, G, u2[k]); mpz_mul_si(t, S, s2[k]); mpz_sub(be, be, t); mpz_mul_si(be, be, s0[k]);
-        if (mpz_sgn(al) <= 0 || mpz_sgn(be) >= 0) continue;
-        mpz_neg(t, be); mpz_fdiv_q(t, t, al); mpz_add_ui(t, t, 1);
+        const unsigned long U0 = (unsigned long)u0[k], S0 = (unsigned long)s0[k];
+        const unsigned long U2 = (unsigned long)u2[k], S2 = (unsigned long)s2[k];
+        /* alpha = G*(s0*u2 + s2*u0) - S*(s0*s2), beta = s0*(G*u2 - S*s2) : 5 operations GMP au lieu de 11
+           quand les produits des petits facteurs tiennent sur 64 bits (u, sigma(u) < 2^31 en pratique) */
+        unsigned long A_, B_, c1_, c2_;
+        if (!__builtin_mul_overflow(S0, U2, &c1_) && !__builtin_mul_overflow(S2, U0, &c2_)
+            && !__builtin_add_overflow(c1_, c2_, &A_) && !__builtin_mul_overflow(S0, S2, &B_)) {
+            mpz_mul_ui(al, G, A_); mpz_submul_ui(al, S, B_);
+        } else {
+            mpz_mul_ui(al, G, S0); mpz_mul_ui(al, al, U2);
+            mpz_mul_ui(t, G, S2); mpz_mul_ui(t, t, U0); mpz_add(al, al, t);
+            mpz_mul_ui(t, S, S0); mpz_mul_ui(t, t, S2); mpz_sub(al, al, t);
+        }
+        if (mpz_sgn(al) <= 0) continue;
+        mpz_mul_ui(be, G, U2); mpz_submul_ui(be, S, S2);
+        if (mpz_sgn(be) >= 0) continue;
+        mpz_mul_ui(be, be, S0);
         if (p0k) { P0 = p0k[k]; maxp = 0; }
-        if (mpz_cmp_ui(t, P0) < 0) mpz_set_ui(t, P0);
+        /* pmin = max(floor(-beta/alpha) + 1, P0), et E0 = alpha*pmin + beta : avec -beta = q*alpha + r,
+           E0 = alpha - r si pmin = q + 1. Le rejet E0 > Emax (la plupart des couples) se fait ainsi apres UNE
+           division, sans la seconde (pmax) */
+        mpz_neg(t, be); mpz_fdiv_qr(t, x, t, al); mpz_add_ui(t, t, 1);
+        if (mpz_cmp_ui(t, P0) < 0) {
+            mpz_set_ui(t, P0);
+            mpz_mul_ui(E, al, P0); mpz_add(E, E, be);
+        } else mpz_sub(E, al, x);
         if (!mpz_fits_ulong_p(t)) { stats[3]++; continue; }
+        if (mpz_cmp(E, Emax) > 0) continue;               /* aucun p : E croit avec p */
         unsigned long pmin = mpz_get_ui(t);
-        mpz_sub(x, Emax, be); mpz_fdiv_q(x, x, al);
-        if (mpz_cmp(x, t) < 0) continue;
-        unsigned long pmax = mpz_fits_ulong_p(x) ? mpz_get_ui(x) : (unsigned long)-1;
-        if (pmax - pmin > maxp) pmax = pmin + maxp;
+        /* pmax = pmin + min(maxp, floor((Emax - E0)/alpha)) */
+        unsigned long pmax;
+        mpz_sub(x, Emax, E);
+        mpz_mul_ui(t, al, maxp);
+        if (mpz_cmp(t, x) <= 0) pmax = pmin + maxp;
+        else {
+            mpz_fdiv_q(x, x, al);
+            pmax = pmin + mpz_get_ui(x);                  /* < maxp ici */
+        }
         mpz_mul_si(M0, be, u0[k]); mpz_mul_si(t, al, u2[k]); mpz_add(M0, M0, t); mpz_abs(M0, M0);
         mpz_mul(M0, M0, G2);
         long g0 = u0[k], h0 = u2[k];
         while (h0) { long r = g0 % h0; g0 = h0; h0 = r; }
         mpz_mul_si(M0, M0, g0); mpz_mul_si(M0, M0, s2[k]);
-        mpz_mul_ui(E, al, pmin); mpz_add(E, E, be);
-        int machine = mpz_fits_ulong_p(E) && mpz_fits_ulong_p(al);
-        unsigned long Eu = machine ? mpz_get_ui(E) : 0, alu = machine ? mpz_get_ui(al) : 0;
 #if AC_EN_LIGNE
+        /* E et alpha suivis sur 128 bits tant qu'ils y tiennent (E > 0, alpha > 0 ici) */
+        int machine = mpz_sizeinbase(E, 2) <= 128 && mpz_sizeinbase(al, 2) <= 128;
+        unsigned __int128 Eu = 0, alu = 0;
+        if (machine) {
+            Eu = ((unsigned __int128)mpz_getlimbn(E, 1) << 64) | mpz_getlimbn(E, 0);
+            alu = ((unsigned __int128)mpz_getlimbn(al, 1) << 64) | mpz_getlimbn(al, 0);
+        }
         const mp_limb_t *m0l = mpz_limbs_read(M0);
         const int m0n = (int)mpz_size(M0);
+#else
+        int machine = mpz_fits_ulong_p(E) && mpz_fits_ulong_p(al);
+        unsigned long Eu = machine ? mpz_get_ui(E) : 0, alu = machine ? mpz_get_ui(al) : 0;
 #endif
+        stats[0] += (long)(pmax - pmin + 1);              /* p testes (compte une fois par couple) */
         for (unsigned long p = pmin; ; p++) {
-            stats[0]++;
             int divise;
             if (machine) {
                 /* divisibilite exacte, sans division (le reste de M0 par E etait le cout de la boucle) */
 #if AC_EN_LIGNE
-                divise = Eu != 0 && ac_divise(m0l, m0n, Eu);
+                unsigned long eh = (unsigned long)(Eu >> 64), el = (unsigned long)Eu;
+                if (eh == 0) divise = el != 0 && ac_divise(m0l, m0n, el);
+                else if ((divise = ac_divise2(m0l, m0n, el, eh)) < 0) {
+                    mpz_set_ui(E, eh); mpz_mul_2exp(E, E, 64); mpz_add_ui(E, E, el);
+                    divise = mpz_divisible_p(M0, E);
+                }
+                if (divise) { mpz_set_ui(E, eh); mpz_mul_2exp(E, E, 64); mpz_add_ui(E, E, el); }
 #else
                 divise = Eu != 0 && mpz_divisible_ui_p(M0, Eu);
-#endif
                 if (divise) mpz_set_ui(E, Eu);
+#endif
             } else divise = mpz_sgn(E) > 0 && mpz_divisible_p(M0, E);
             if (divise) {
                 mpz_set_ui(pz, p);
@@ -993,8 +1077,15 @@ static int ac_impl(const char *Gfac, const char *Ss, int n, const long *u0, cons
             }
             if (p >= pmax) break;
             if (machine) {
+#if AC_EN_LIGNE
+                if (Eu > ~(unsigned __int128)0 - alu) {        /* E + alpha >= 2^128 : suite en GMP */
+                    mpz_set_ui(E, (unsigned long)(Eu >> 64)); mpz_mul_2exp(E, E, 64);
+                    mpz_add_ui(E, E, (unsigned long)Eu); mpz_add(E, E, al); machine = 0;
+                } else Eu += alu;
+#else
                 if (Eu > (unsigned long)-1 - alu) { mpz_set_ui(E, Eu); mpz_add(E, E, al); machine = 0; }
                 else Eu += alu;
+#endif
             } else mpz_add(E, E, al);
         }
     }
