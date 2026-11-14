@@ -94,10 +94,26 @@ It takes about one second and finds a 4-cycle of 31 digits (number 471 of the ca
 | Option | Meaning |
 |---|---|
 | `--G "3^4*11^2*13"` | a single G |
-| `--liste file.txt` | one G per line (first word of the line); duplicates are removed |
+| `--liste file.txt` | one G per line (first word of the line); duplicate values are removed |
 | `--depuis-catalogue sociable.txt` | the G of the "pure" Borho 4-cycles of a catalogue (writes `G_catalogue.txt`) |
 | `--hors-catalogue 1e5` | all G ≤ 1e5 with 1.8 ≤ σ(G)/G < 2 that are not in `G_catalogue.txt` |
 | `--depuis-paires c2_80*.txt.gz` | the exact common parts of the amicable pairs of those files |
+| `--impairs` | exclude even G |
+| `--hmin 1.85` | exclude G for which σ(G)/G is below 1.85 (replace 1.85 with the desired threshold) |
+| `--exclure file1 file2 ...` | exclude G already present in the specified files; see details below |
+
+`--exclure` accepts either or both of these file formats, which can be mixed:
+
+- **G lists:** the first word on each line is read as G. This includes files such as
+  `G_paires_22.txt`, whose lines have the form `G number`.
+- **`.faits` files:** every G recorded in the file is excluded, regardless of the run parameters
+  recorded there. For example, a G marked as done with `--u 1e6` is also excluded from a run with
+  `--u 1e7`. Do not include `.faits` files from earlier runs when searching again with a different
+  `--u` value.
+
+G values are compared numerically, not by their written factorization, so `3^2*5*19` and
+`19*3^2*5` are recognized as the same G. Duplicate removal in the input list also compares G
+values rather than their text representations.
 
 `--debut N --nombre M` processes only lines N to N+M−1 of the list.
 
@@ -188,3 +204,4 @@ print(all(divisor_sigma(c[i]) - c[i] == c[(i + 1) % 4] for i in range(4)))
 - S. Blankenagel, W. Borho, A. vom Stein, *New amicable four-cycles*,
   Math. Comp. 72 (2003), 2071–2076.
 - D. Moews, catalogue of sociable numbers, `djm.cc/sociable.txt`.
+
