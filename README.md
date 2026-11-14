@@ -1,61 +1,50 @@
-[README_apparie.txt](https://github.com/user-attachments/files/34837372/README_apparie.txt)
 # Sociable-4cycle
-A script to find sociable4 cycle (aliquot)
-# apparie_graines — searching for aliquot 4-cycles of Borho type
 
-`apparie_graines.py` searches for Borho-type sociable 4-cycles without starting from amicable pairs.
-The program builds the two seeds directly from a common part `G` and matches pairs `(u0, u2)` by the
-value of `u / sigma(u)` before testing the final Borho conditions.
-
-For a common part `G` (an odd integer with `1 < sigma(G) / G < 2`), the seeds are
+A script to search for sociable 4-cycles (aliquot cycles of length 4) using the construction of Borho and Blankenagel, Borho and vom Stein, without starting from amicable pairs. The two seeds are constructed directly from a common part `G`:
 
 ```
 a1 = G · u0 · p        a2 = G · u2
 ```
 
-with `u0, u2 <= --u`, `gcd(u0, G) = gcd(u2, G) = 1`, and a large unknown prime `p >= --p0`.
-The program filters candidate pairs `(u0, u2)` by their `y = u / sigma(u)` values, then checks the
-exact divisibility conditions, the primality of `p`, and the full Borho Theorem 1 before emitting a cycle.
-
----
+The program matches candidate pairs `(u0, u2)` by sorting `u / sigma(u)`, then checks the necessary divisibility conditions, primality of `p`, and Borho's Theorem 1. Cycles are verified before being written.
 
 ## 1. Files
 
 | File | Role |
 |---|---|
-| `apparie_graines.py` | main program |
-| `borho4.py` | Borho theorem code, cycle verification and C loader |
-| `borho4c.c` | C implementation for the final sieve and checks |
-| `c2io.py` | reader for `c2_*` amicable-pair files |
-| `apparie_gpu.cu` | GPU/CPU core loop for the `(u0, u2, p)` search |
+| `apparie_graines.py` | Main program |
+| `borho4.py` | Borho theorems, cycle verification, and C-module loader |
+| `borho4c.c` | GMP C module for candidate checks and Theorem 1 sieve |
+| `c2io.py` | Reader for `c2_*` amicable-pair files |
+| `apparie_gpu.cu` | Shared GPU/CPU core loop for candidate pairs |
 
-Put all files in the same directory.
+Keep the files in the same directory.
 
 ## 2. Requirements
 
-- Python 3.8+ with `numpy`, `sympy`, `gmpy2`
+- Python 3.8+ with `numpy`, `sympy`, and `gmpy2`:
   ```bash
   pip install numpy sympy gmpy2
   ```
-- `gcc` and the GMP headers (`libgmp-dev` on Debian/Ubuntu)
-- CUDA toolkit for the GPU build (`nvcc`) if using the CUDA kernel
-- `g++` with OpenMP for the CPU fallback build
+- `gcc` and GMP development headers (for example, `sudo apt install gcc libgmp-dev` on Debian/Ubuntu).
+- For CUDA: an NVIDIA GPU and the CUDA toolkit (`nvcc`).
+- For the CPU core loop: `g++` with OpenMP. The program compiles `libapparie_cpu.so` automatically when needed.
 
 ## 3. Compilation
 
-Build the C module (done automatically if missing):
+The GMP C module is built automatically if missing or out of date. To build it manually:
 
 ```bash
 gcc -O2 -shared -fPIC -o libborho4c.so borho4c.c -lgmp -lm
 ```
 
-Build the GPU core loop:
+Build the CUDA core loop (change `sm_120` to match your GPU):
 
 ```bash
 nvcc -O3 -arch=sm_120 -Xcompiler -fPIC -shared -o libapparie_gpu.so apparie_gpu.cu
 ```
 
-For CPU validation:
+Build the CPU core loop manually if desired:
 
 ```bash
 g++ -O3 -fopenmp -fPIC -shared -x c++ -o libapparie_cpu.so apparie_gpu.cu
@@ -67,106 +56,78 @@ g++ -O3 -fopenmp -fPIC -shared -x c++ -o libapparie_cpu.so apparie_gpu.cu
 python3 apparie_graines.py --G "3^2*5*13*19" --u 1e3 --p0 1e5
 ```
 
-This should return a 4-cycle quickly and is useful as a smoke test.
-
 ## 5. Usage
 
-### Where the common parts G come from
+### Sources of common parts `G`
 
 | Option | Meaning |
 |---|---|
-| `--G "3^4*11^2*13"` | a single common part `G` |
-| `--liste file.txt` | one `G` per line; the first word counts |
-| `--depuis-catalogue sociable.txt` | list the `G` values found in the Borho 4-cycles of a catalogue |
-| `--hors-catalogue 1e5` | all `G <= 1e5` with `1.8 <= sigma(G)/G < 2` not already in the catalogue |
-| `--depuis-paires c2_80*.txt.gz` | exact common parts extracted from the amicable-pair lists |
-| `--impairs` | exclude even `G` |
-| `--exclure file1 file2 ...` | exclude `G` already present in these files |
+| `--G "3^4*11^2*13"` | Search one `G` value |
+| `--liste file.txt` | Read one `G` per line (the first word is used) |
+| `--depuis-catalogue sociable.txt` | Extract common parts from pure Borho 4-cycles; writes `G_catalogue.txt` |
+| `--hors-catalogue 1e5` | Generate `G <= 1e5` with `1.8 <= sigma(G)/G < 2`, excluding the catalogue |
+| `--depuis-paires c2_80*.txt.gz` | Extract exact common parts from amicable-pair files |
+| `--impairs` | Exclude even `G` values |
+| `--exclure files...` | Exclude `G` values found in the specified files |
 
-`--exclure` accepts a mix of:
+`--exclure` accepts a mixture of ordinary `G` lists and `.faits` files. For list files, the first word on each line is read as `G` (including lines such as `G number`). For `.faits` files, every recorded `G` is excluded regardless of the run parameters recorded there. Thus, a `G` marked done with `--u 1e6` is also excluded from a search with `--u 1e7`; do not include old `.faits` files when you intend to search those values again with a different `--u`.
 
-- plain `G` lists: the first word on each line is interpreted as a number or factorization,
-- `.faits` files: any `G` recorded there is excluded regardless of the run parameters used to produce it.
+`G` values and duplicates are compared numerically, not by their written factorization: `3^2*5*19` and `19*3^2*5` are the same value. Files that provide or are generated as the current run's input list are ignored by `--exclure`, preventing the run from excluding its own search set.
 
-Important notes:
-
-- `G` values are compared numerically, not by their textual writing. For example,
-  `3^2*5*19` and `19*3^2*5` are treated as the same `G`.
-- Duplicates inside the same input list are removed by numeric value, not text.
-- Files generated during the current run are ignored by the exclusion filter to avoid self-excluding the
-  search set (for example generated `G_catalogue.txt`, `G_paires.txt`, or the active output list).
-
-`--debut N --nombre M` restricts the scan to the slice of the list from line `N` to `N + M - 1`.
+Filters apply to the full input source before `--debut N --nombre M` selects a slice.
 
 ### Main options
 
 | Option | Default | Meaning |
-|---|---|---|
-| `--u` | `1e5` | `u0, u2 <= u` |
-| `--p0` | `1e5` | lower bound for the prime `p` |
-| `--K` | `1e7` | keep `D <= K * G^2` |
-| `--budget` | `60` | time budget per `G`; cut `G` are exported to `<out>.incomplets` |
-| `--out` | `apparie_cycles.txt` | output file |
-| `--jobs` | `1` | worker processes |
-| `--gpu [lib]` | off | run the core loop on GPU (or use the specified library) |
-| `--connus f1 f2 ...` | — | known cycle catalogues used for duplicate detection |
-| `--refaire` | — | rerun `G` already recorded in `.faits` |
-| `--hmin 1.85` | — | exclude `G` with `sigma(G)/G < 1.85` |
+|---|---:|---|
+| `--u` | `1e5` | Upper bound for `u0` and `u2` |
+| `--p0` | `1e5` | Lower bound for the prime `p` |
+| `--maxp` | `2000` | Number of `p` values tested per candidate pair above the minimum |
+| `--K` | `1e7` | Bound `D <= K * G^2` |
+| `--budget` | `60` | Seconds per `G`; interrupted searches are written to `<out>.incomplets` |
+| `--jobs` | `1` | Number of worker processes |
+| `--recyclage N` | `10` | Replace each worker after `N` values of `G` to release memory; with GPU mode, replacement reloads CUDA |
+| `--gpu [lib]` | off | Use `libapparie_gpu.so` (or the named library); when enabled without a path, GPU is tried before the CPU library |
+| `--sans-noyau` | off | Disable the fast CPU/GPU core loop and use the standard C path (for checking) |
+| `--connus f1 f2 ...` | — | Known cycle catalogues used to label cycles as known/new |
+| `--out` | `apparie_cycles.txt` | Cycle output file |
+| `--refaire` | off | Re-run `G` already marked complete in `<out>.faits` |
+| `--hmin H` | off | Exclude `G` for which `sigma(G)/G < H` (for example, `--hmin 1.85`) |
 
-### Core-process improvement
+### Core-loop and process behavior
 
-The GPU/CPU core loop was tightened to reduce overhead in the repeated `(u0, u2, p)` filtering step:
+Without `--gpu`, the program uses the OpenMP CPU core loop (`libapparie_cpu.so`) by default and compiles it from `apparie_gpu.cu` if necessary. The number of OpenMP threads per worker is limited to the available CPU cores divided by `--jobs`, so multiple worker processes share the cores instead of each spawning a full thread team. Use `--sans-noyau` (or `--sans-c`) to compare against the standard C implementation. Use `--recyclage N` to periodically replace workers and return memory to the system; increase `N` when individual `G` searches are short to avoid excessive worker/CUDA restarts.
 
-- the work is staged in bounded chunks,
-- output buffers are reused efficiently,
-- the thread pool is kept under control to avoid runaway scheduling overhead,
-- the C/CUDA core processes the fast arithmetic and only returns the surviving candidates to Python.
-
-This keeps the expensive Borho checks concentrated in the low-level kernel while the Python layer remains
-responsible only for verifying and writing the final cycles.
-
-### Recommended settings
+Example using the GPU:
 
 ```bash
 python3 apparie_graines.py --liste my_G.txt --u 1e6 --p0 1000 --maxp 200 --budget 300 \
-    --jobs 4 --gpu --connus sociable.txt --out my_run.txt
+  --jobs 4 --gpu --connus sociable.txt --out my_run.txt
 ```
 
-For a second pass over promising `G` values, a larger `--u` often pays off:
+Example using the default CPU core loop with four workers:
 
 ```bash
-python3 apparie_graines.py --liste productive_G.txt --u 1e7 --p0 1000 --maxp 200 --budget 600 \
-    --jobs 4 --gpu --connus sociable.txt --out my_run_u1e7.txt
+python3 apparie_graines.py --liste my_G.txt --u 1e6 --p0 1000 --maxp 200 --budget 300 \
+  --jobs 4 --out my_run_cpu.txt
 ```
 
-## 6. Output
+## 6. Output and resuming
 
-- cycles are appended to `--out`
-- completed `G` values are stored in `<out>.faits`
-- timed-out or cut `G` values are written to `<out>.incomplets`
-- run-time errors are written to `<out>.erreurs`
-- the program prints a final statistics block with the counts of candidate pairs, tested primes, survivors,
-  and time spent in the filtering stages
+- Cycles are appended to `--out`, with members in cyclic order. A cycle already in the file is not written again.
+- `<out>.faits` records completed `G` values together with the run parameters (`u`, `p0`, `K`, `maxp`). Re-running the same command skips completed values; use `--refaire` to repeat them. A single `--G` is always searched again.
+- `<out>.incomplets` lists `G` cut off by the time budget.
+- `<out>.erreurs` records `G` that raised an error; the run continues.
+- Ctrl-C stops the run while preserving completed progress.
 
-## 7. Practical advice
+The program prints final statistics for candidate pairs, tested primes, theorem checks, and time spent in the filtering stages. Some runtime messages remain in French.
 
-- prefer odd `G` with `sigma(G)/G` between `1.85` and `2`
-- small `G` values are usually the most productive
-- good searches often come from the exact common parts of known cycles and their nearby variants
-- if the search stalls, try a different `--u`, `--p0`, or a narrower exclusion list
+## 7. GPU limits
 
-## 8. Checking a cycle independently
-
-```python
-from sympy import divisor_sigma
-c = [n1, n2, n3, n4]
-print(all(divisor_sigma(c[i]) - c[i] == c[(i + 1) % 4] for i in range(4)))
-```
+The GPU loop handles `G < 2^44`, `sigma(G) < 2^46`, `u < 2^24`, `sigma(u) < 2^26`, and `Emax < 2^63`. Other cases use the CPU/C path. For large `G`, explicitly enabling GPU mode may cap `E` at `2^63 - 1`; such a run is marked as bounded and is not recorded as fully completed in `.faits`.
 
 ## References
 
-- W. Borho, *Über die Fixpunkte der k-fach iterierten Teilersummenfunktion*,
-  Mitt. Math. Ges. Hamburg 9 (1969), 34–48.
-- S. Blankenagel, W. Borho, A. vom Stein, *New amicable four-cycles*,
-  Math. Comp. 72 (2003), 2071–2076.
+- W. Borho, *Über die Fixpunkte der k-fach iterierten Teilersummenfunktion*, Mitt. Math. Ges. Hamburg 9 (1969), 34–48.
+- S. Blankenagel, W. Borho, A. vom Stein, *New amicable four-cycles*, Math. Comp. 72 (2003), 2071–2076.
 - D. Moews, catalogue of sociable numbers, `djm.cc/sociable.txt`.
