@@ -485,18 +485,26 @@ def G_hors_catalogue(Gmax, deja):
 
 def G_des_paires(fichiers, gmin, gmax):
     """[(G, nombre de paires)] : parties communes exactes (memes premiers, memes exposants) des paires."""
+    import gzip
     compte = {}
     for path in fichiers:
         prev = None
-        with c2io.ouvrir_texte(path) as fh:           # .txt, .gz classique ou .gz FZ
+        # lecture BRUTE : seule la factorisation (apres « = ») sert, et elle figure telle quelle dans tous les
+        # formats (n=fact ; =fact et !ligne pour le format FZ). c2io.ouvrir_texte reconstruisait chaque nombre
+        # n d'un fichier FZ (un produit de facteurs en Python par ligne) : c'etait l'essentiel du temps.
+        fh = gzip.open(path, "rt", encoding="utf-8", errors="replace") if path.endswith(".gz") else \
+            open(path, encoding="utf-8", errors="replace")
+        with fh:
             for l in fh:
+                if l.startswith("!"):
+                    l = l[1:]                          # FZ : ligne d'origine gardee telle quelle
                 if "=" not in l:
                     continue
                 if prev is None:
                     prev = l
                     continue
-                j1 = {t[:-2] if t.endswith("^1") else t for t in prev.split("=")[1].strip().replace(" ", "").split("*")}
-                j2 = {t[:-2] if t.endswith("^1") else t for t in l.split("=")[1].strip().replace(" ", "").split("*")}
+                j1 = {t[:-2] if t.endswith("^1") else t for t in prev.split("=", 1)[1].strip().replace(" ", "").split("*")}
+                j2 = {t[:-2] if t.endswith("^1") else t for t in l.split("=", 1)[1].strip().replace(" ", "").split("*")}
                 prev = None
                 k = "*".join(sorted(j1 & j2, key=lambda t: int(t.split("^")[0])))
                 if k:
