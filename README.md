@@ -153,9 +153,27 @@ uses the standard C path.
 
 ## 7. Limits of the GPU loop
 
-The GPU kernel works with 64/128-bit arithmetic and handles the usual domain of the search. For larger
-values, the CPU path may be used instead, and very large `G` values are progressively bounded by the
-`Emax` limit used in the fast arithmetic.
+The kernel (`apparie_gpu.cu`, same code for the GPU and the OpenMP CPU build) works in 64/128-bit
+integers. A `G` is handled by the kernel when
+
+- `G < 2^44 ≈ 1.76 · 10^13` and `sigma(G) < 2^46`;
+- with `bG, bS, bu, bs` the bit lengths of `G`, `sigma(G)`, the largest `u` and the largest `sigma(u)`:
+  `bu + bs + max(bG+bu, bS+bs) <= 125`, `bG + bs + 2·bu + 1 <= 125`, `bu <= 31`, `bs <= 33`.
+  In practice `--u` can go well beyond `2^24` for small `G` (`3 · 10^7` and `6 · 10^7` have been used).
+
+**Hybrid mode.** `E <= K · G^2 / sigma(G)` no longer has to fit in 63 bits. When that bound reaches
+`2^63` (about `G > 1.7 · 10^12` with `K = 1e7`), the kernel tests `E < 2^63` in 64-bit arithmetic and
+`2^63 <= E < 2^127` in 128-bit arithmetic. The search is complete and the `G` is recorded in `.faits`
+(statistics: `emax_hybride`, and `p_128` = primes returned by the 128-bit path). This requires
+`--gpu` (GPU, or `--gpu cpu` for the OpenMP build).
+
+Outside this domain the standard C path (GMP) is used; it is far slower.
+
+**Kernel layout.** Each GPU thread alternates "take the next pair `(u0, u2)`" and "test one `p`", so a
+thread never waits for the `p` loop of the 31 others in its warp. Measured on an RTX 50-series card:
+about `1.3 · 10^10` pairs per second, 1.7 times the previous kernel, with identical results.
+Compiling with `-DAG_SIMU` (CPU) runs the same warp logic on 32 simulated lanes, which allows the
+scheduling to be checked without a GPU.
 
 ## 8. Practical advice (from experience)
 
@@ -166,41 +184,39 @@ heuristics, not mathematical guarantees.
 
 - Prefer odd `G`. Even values have not produced cycles in the runs so far.
 - A useful range is `1.85 <= sigma(G)/G < 2`. Below `1.85`, the yield has been roughly halved.
-- Smaller `G` values are generally both faster and more productive. A practical range is about `10^5`
-  to `10^8`, with smaller values preferred.
+- Most cycles come from `G` between about `10^5` and `10^8`, but larger `G` (up to `2^44`) are now
+  cheap at `u = 10^7` and also produce cycles.
 - Start with exact common parts of known cycles and their one-change variants. Variants involving two
   changes have yielded much less.
-- A ratio near `2` can make the number of candidate pairs explode. Values around `1.97` have been slow
-  or cut short by the time budget.
+- A ratio near `2` makes the number of candidate pairs grow; such `G` are slow but productive.
 
 ### Size and arithmetic limits
 
-- Above about `1.7 · 10^12`, the GPU has to bound `E` (the `emax_borne` statistic). The search is then
-  incomplete, and that `G` is not marked as completed.
-- Above `2^44 ≈ 1.76 · 10^13`, or when `sigma(G) > 2^46`, the GPU kernel rejects `G` and the CPU C
-  path is used instead; this can be about 100 times slower.
-- With `u = 10^7`, `G` above `10^12` is generally not worthwhile: runs tend to hit the 600-second
-  budget without finding a cycle. For example, 36 budget-cut values ranged from `1.8 · 10^13` to
-  `2 · 10^14`.
+- Up to `2^44 ≈ 1.76 · 10^13` the GPU handles `G` completely (hybrid mode above about `1.7 · 10^12`).
+  With `u = 10^7`, a `G` near `10^13` takes a few seconds, and this range has produced a cycle
+  (`G = 3^6·5^2·547·701·1093`).
+- Above `2^44`, or when `sigma(G) >= 2^46`, the kernel rejects `G` and the CPU C path is used instead;
+  this can be about 100 times slower.
 
 ### Choosing `u`
 
 | `u` | Practical range for `G` |
 |---:|---|
-| `10^6` | Values up to `10^12` are generally fast. |
-| `10^7` | Prefer `G < 10^12`; larger values are usually not worthwhile. |
-| `3 · 10^7` | Prefer `G < 10^6`; values up to `10^7` may be worth trying. |
+| `10^6` | Fast for every `G` the kernel accepts. |
+| `10^7` | Fine up to `2^44`; a few seconds per `G` near `10^13`. |
+| `3 · 10^7` | Best yield so far; prefer `G < 10^8`. Small `G` are the slow ones (more pairs). |
+| `6 · 10^7` | About 4 times the cost of `3 · 10^7`; set `--budget` explicitly. |
 
-The number of candidate pairs grows roughly as `u^2` and also increases with `G`, so the time per `G`
-can rise quickly as either grows.
+The number of candidate pairs grows roughly as `u^2`. Cycles found at a larger `u` all have a cofactor
+above the previous limit, so re-running productive `G` at a larger `u` finds new cycles. The default
+`--budget` is 60 seconds per `G`: raise it for large `u`, otherwise slow `G` end up in `.incomplets`.
 
 ### Suggested default filters
 
 For candidate lists, a reasonable starting point is odd `G` with
-`1.85 <= sigma(G)/G < 1.96`, `G < 10^12` when `u = 10^7`, and `G < 10^7` when `u = 3 · 10^7`.
-The upper ratio cutoff of `1.96` is tentative, not an established limit: two `G` values with ratio
-`1.971` were slow, but it is not yet known whether they would have produced cycles if allowed to run
-longer. Keeping values up to `2` is also reasonable if the available time budget permits it.
+`1.85 <= sigma(G)/G < 2`, `G < 2^44` when `u = 10^7`, and `G < 10^8` when `u = 3 · 10^7`.
+Do not cut the ratio below `2`: the `G` closest to `2` have been the most productive, even though
+they are the slowest.
 
 A larger `--u` often pays off much more than a larger `--maxp`, but its cost grows quickly; choose it
 with the size of `G` in mind.

@@ -168,6 +168,9 @@ def lib_gpu():
                                           ctypes.POINTER(ctypes.c_ulonglong)]
                     L.ag_scan.restype = ctypes.c_int
                     L.ag_liberer.restype = None
+                    if getattr(L, "ag_emax_vrai", None) is not None:   # noyau hybride : E > 2^63 rendu au C
+                        L.ag_emax_vrai.argtypes = [u64, u64]
+                        L.ag_emax_vrai.restype = None
                     fils = getattr(L, "ag_fils", None)     # version CPU : coeurs partages entre les --jobs
                     if fils is not None and P.get("fils"):
                         fils.argtypes = [ctypes.c_int]
@@ -233,7 +236,22 @@ def _chercher(g):
     Uu, Ss, Y = Ut.take(ix), St.take(ix), Yt.take(ix)
     del ix
     Emax = int(K * Gv * Gv // S)
-    if P.get("gpu") not in (None, "cpu") and Emax >= 1 << 63 and lib_gpu():
+    Evrai = 0                                          # > 0 : noyau hybride (E <= 2^63 noyau, au-dela en C)
+    if (Emax >= 1 << 63 and Emax < 1 << 127 and P.get("gpu") and lib_gpu()
+            and getattr(lib_gpu()[0], "ag_emax_vrai", None) is not None):
+        # noyau a jour : il traite E < 2^63 en 64 bits et 2^63 <= E <= K*G^2/S en 128 bits (p rendus avec
+        # le bit 63 leve, theoreme 2 refait en C) ; seuls les couples hors domaine reviennent avec p = 0.
+        # La recherche est donc complete et le G est note dans .faits.
+        Evrai = Emax
+        Emax = (1 << 63) - 1
+        st["emax_hybride"] = 1
+    elif os.environ.get("AG_TEST_CAP") and P.get("gpu") and lib_gpu() \
+            and getattr(lib_gpu()[0], "ag_emax_vrai", None) is not None:
+        # controle du chemin hybride sur de petits G : borne du noyau artificiellement abaissee
+        Evrai = Emax
+        Emax = max(1, Emax // int(os.environ["AG_TEST_CAP"]))
+        st["emax_hybride"] = 1
+    elif P.get("gpu") not in (None, "cpu") and Emax >= 1 << 63 and lib_gpu():
         # (seulement avec --gpu explicite : par defaut, ces G restent sur le chemin C, sans borne)
         # gros G (au-dela de ~1,7e12 pour K = 1e7) : le noyau GPU travaille avec E < 2^63. Plutot que de
         # passer tout le G sur CPU (des minutes), on borne E a 2^63 - 1 : D <= S * (2^63 - 1) au lieu de K G^2.
@@ -275,8 +293,9 @@ def _chercher(g):
         cap = 1 << 16
         ok_ = (ctypes.c_int * cap)(); op_ = (ctypes.c_ulong * cap)(); sts = (ctypes.c_long * 8)()
         gfac, ss, emax = fmt(G).encode(), str(S).encode(), str(Emax).encode()
+        emax_vrai = str(Evrai).encode() if Evrai else emax
 
-        def appel(ii, jj, p0=None, mp=None):
+        def appel(ii, jj, p0=None, mp=None, em=None):
             """Un paquet de couples en C ; si le tampon de sortie deborde, le paquet est coupe en deux."""
             p0 = P0 if p0 is None else p0
             mp = P.get("maxp", 2000) if mp is None else mp
@@ -284,12 +303,12 @@ def _chercher(g):
             a_u2 = np.ascontiguousarray(Uu[jj], dtype=np.int64); a_s2 = np.ascontiguousarray(Ss[jj], dtype=np.int64)
             avant = list(sts)
             r = f(gfac, ss, len(ii), a_u0.ctypes.data_as(L), a_s0.ctypes.data_as(L), a_u2.ctypes.data_as(L),
-                  a_s2.ctypes.data_as(L), p0, mp, emax, 10 ** 6, ok_, op_, cap, sts)
+                  a_s2.ctypes.data_as(L), p0, mp, emax if em is None else em, 10 ** 6, ok_, op_, cap, sts)
             if r == -2 and len(ii) > 1:
                 for i in range(8):
                     sts[i] = avant[i]                      # le paquet est refait en deux moities
                 h_ = len(ii) // 2
-                return appel(ii[:h_], jj[:h_], p0, mp) + appel(ii[h_:], jj[h_:], p0, mp)
+                return appel(ii[:h_], jj[:h_], p0, mp, em) + appel(ii[h_:], jj[h_:], p0, mp, em)
             if r < 0:
                 raise RuntimeError(f"apparie_couples2 : code {r}")
             return [(int(a_u0[ok_[m]]), int(a_s0[ok_[m]]), int(a_u2[ok_[m]]), int(a_s2[ok_[m]]), int(op_[m]))
@@ -308,7 +327,7 @@ def _chercher(g):
                 a_p = np.ascontiguousarray(p_, dtype=np.uint64)
                 avant = list(sts)
                 r = fp(gfac, ss, len(i_), a_u0.ctypes.data_as(L), a_s0.ctypes.data_as(L), a_u2.ctypes.data_as(L),
-                       a_s2.ctypes.data_as(L), a_p.ctypes.data_as(ctypes.POINTER(ctypes.c_ulong)), emax, 10 ** 6,
+                       a_s2.ctypes.data_as(L), a_p.ctypes.data_as(ctypes.POINTER(ctypes.c_ulong)), emax_vrai, 10 ** 6,
                        ok_, op_, cap, sts)
                 if r == -2:
                     for i in range(8):
@@ -323,8 +342,16 @@ def _chercher(g):
             return res
 
         gp = lib_gpu()
-        dans = (gp and Gv < 1 << 44 and S < 1 << 46 and U < 1 << 24 and len(Ss) and int(Ss.max()) < 1 << 26
-                and Emax < 1 << 63 and tot > 0)
+        # domaine du noyau (128 bits) : avec bG, bS, bu, bs les tailles en bits de G, S, max u, max sigma(u),
+        # |beta| < 2^(bs + max(bG+bu, bS+bs)), alpha < 2^(bG+bs+bu+1) et X = u0*beta + alpha*u2 doit tenir
+        # dans un i128 : bu + bs + max(bG+bu, bS+bs) <= 125 et bG + bs + 2*bu + 1 <= 125.
+        # (Ancienne borne fixe G < 2^44, S < 2^46, u < 2^24, s < 2^26 : un cas particulier.) Les petits G
+        # passent ainsi sur GPU jusqu'a u ~ 2^30 au lieu de 2^24 = 1.68e7.
+        dans = False
+        if gp and len(Ss) and Emax < 1 << 63 and tot > 0 and Gv < 1 << 44 and S < 1 << 46 and len(Uu) < 1 << 31:
+            bG, bS = int(Gv).bit_length(), int(S).bit_length()
+            bu, bs = int(Uu.max()).bit_length(), int(Ss.max()).bit_length()
+            dans = bu + bs + max(bG + bu, bS + bs) <= 125 and bG + bs + 2 * bu + 1 <= 125 and bu <= 31 and bs <= 33
         if dans:
             Lg = gp[0]
             st["gpu" if gp[2] else "noyau_cpu"] = 1
@@ -335,10 +362,12 @@ def _chercher(g):
             if Lg.ag_charger(a_U.ctypes.data, a_S.ctypes.data, len(a_U), a_jx.ctypes.data, a_lo.ctypes.data,
                              a_cs.ctypes.data, len(a_cs), Gv, S, P0, P.get("maxp", 2000), Emax, capg) != 0:
                 raise RuntimeError("ag_charger : erreur (voir le message CUDA)")
+            if getattr(Lg, "ag_emax_vrai", None) is not None:
+                Lg.ag_emax_vrai(Evrai >> 64, Evrai & ((1 << 64) - 1))
             oi = np.zeros(capg, dtype=np.int32); oj = np.zeros(capg, dtype=np.int32); op = np.zeros(capg, dtype=np.uint64)
             ntg = ctypes.c_ulonglong(0); n2g = ctypes.c_ulonglong(0)
-            nt_gpu = n2_gpu = n_unit = 0
-            pas = 1 << 28
+            nt_gpu = n2_gpu = n_unit = n_128 = 0
+            pas = 1 << int(os.environ.get("AG_PAS", "31"))   # couples par appel du noyau (2^28 avant : 8 % plus lent)
             t_ = 0
             try:
                 while t_ < tot:
@@ -358,11 +387,16 @@ def _chercher(g):
                         raise RuntimeError(f"ag_scan : code {r}")
                     nt_gpu += ntg.value
                     n2_gpu += n2g.value
+                    n128 = int((op[:r] >> np.uint64(63)).sum())    # bit 63 : p de la suite 128 bits (E > 2^63),
+                    op[:r] &= np.uint64((1 << 63) - 1)             # sans theoreme 2 fait par le noyau
+                    st["p_128"] = st.get("p_128", 0) + n128
                     m_ = op[:r] != 0                       # (u0, u2, p) refaits en C, chacun avec son p
                     if not m_.all():                       # p = 0 : hors domaine, couple entier en C
-                        for u0, s0, u2, s2, p in appel(oi[:r][~m_].copy(), oj[:r][~m_].copy()):
+                        st["rendus_C"] = st.get("rendus_C", 0) + int((~m_).sum())
+                        for u0, s0, u2, s2, p in appel(oi[:r][~m_].copy(), oj[:r][~m_].copy(), em=emax_vrai):
                             cyc += cycles_de(G, Gv, S, u0, s0, u2, s2, p)
                     n_unit += int(m_.sum())
+                    n_128 += n128
                     for u0, s0, u2, s2, p in appel_p(oi[:r][m_].copy(), oj[:r][m_].copy(), op[:r][m_].copy()):
                         cyc += cycles_de(G, Gv, S, u0, s0, u2, s2, p)
                     st["survivants"] = st.get("survivants", 0) + r
@@ -371,16 +405,18 @@ def _chercher(g):
             finally:
                 Lg.ag_liberer()
             st["p_testes"] = nt_gpu + int(sts[0]) - n_unit       # les survivants refaits en C comptent deux fois
-            st["th2"], st["premiers"] = n2_gpu + int(sts[1]) - n_unit, int(sts[2])
+            st["th2"], st["premiers"] = n2_gpu + int(sts[1]) - (n_unit - n_128), int(sts[2])
             st["hors_64_bits"] = int(sts[3])
             st["th1_C_aucun_d1"], st["th1_C_ok"], st["th1_C_trop_div"], st["th1_Python"] = (int(sts[4]), int(sts[5]),
                                                                                          int(sts[6]), int(sts[7]))
+            if Evrai:
+                cyc = list({repr(c): c for c in cyc}.values())
             return g, cyc, st
         for d, ii, jj in ((d, I_[d:d + 4096], J_[d:d + 4096]) for I_, J_ in paquets() for d in range(0, len(I_), 4096)):
             if budget and time.time() - t0 > budget:
                 st["incomplet"] = 1
                 break
-            for u0, s0, u2, s2, p in appel(ii, jj):
+            for u0, s0, u2, s2, p in appel(ii, jj, em=emax_vrai):   # chemin C : toujours la vraie borne
                 cyc += cycles_de(G, Gv, S, u0, s0, u2, s2, p)
         st["p_testes"], st["th2"], st["premiers"] = int(sts[0]), int(sts[1]), int(sts[2])
         st["hors_64_bits"] = int(sts[3])
@@ -397,7 +433,7 @@ def _chercher(g):
         if alpha <= 0 or beta >= 0:
             continue
         pmin = max(P0, -beta // alpha + 1)
-        pmax = min((Emax - beta) // alpha, pmin + P.get("maxp", 2000))
+        pmax = min(((Evrai or Emax) - beta) // alpha, pmin + P.get("maxp", 2000))
         if pmax < pmin:
             continue
         M0 = abs(u0 * beta + alpha * u2) * Gv * Gv * gcd(u0, u2) * s2      # E divise M0
@@ -423,6 +459,9 @@ def _chercher(g):
 
 def cycles_de(G, Gv, S, u0, s0, u2, s2, p):
     """Theoreme 1 complet (Python) pour les graines a1 = G*u0*p, a2 = G*u2 : les 4-cycles, verifies."""
+    if os.environ.get("AG_TRACE"):                     # controle : graines (u0, u2, p) passees au theoreme 1
+        with open(os.environ["AG_TRACE"], "a") as tr:
+            tr.write(f"{Gv} {u0} {u2} {p}\n")
     a1, a2 = Gv * u0 * p, Gv * u2
     sa1, sa2 = S * s0 * (p + 1), S * s2
     f1 = dict(G); f1.update({int(q): e for q, e in sympy.factorint(u0).items()}); f1[p] = 1
