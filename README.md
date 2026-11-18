@@ -268,3 +268,12 @@ print(all(divisor_sigma(c[i]) - c[i] == c[(i + 1) % 4] for i in range(4)))
 - W. Borho, *Über die Fixpunkte der k-fach iterierten Teilersummenfunktion*, Mitt. Math. Ges. Hamburg 9 (1969), 34–48.
 - S. Blankenagel, W. Borho, A. vom Stein, *New amicable four-cycles*, Math. Comp. 72 (2003), 2071–2076.
 - D. Moews, catalogue of sociable numbers, `djm.cc/sociable.txt`.
+
+## License
+
+This project is released under the GNU General Public License, version 3 or (at your option) any later
+version (GPL-3.0-or-later). See the `LICENSE` file for the full text.
+
+You may use, modify and redistribute it; any distributed modified version must remain under the same license
+and come with its source code.
+
