@@ -421,7 +421,10 @@ def _passe(g, G, Gv, S, Uu, Ss, jx, lo, n, Emax, Evrai, st, cyc, t0, noyau_seul=
             oi = np.zeros(capg, dtype=np.int32); oj = np.zeros(capg, dtype=np.int32); op = np.zeros(capg, dtype=np.uint64)
             ntg = ctypes.c_ulonglong(0); n2g = ctypes.c_ulonglong(0)
             nt_gpu = n2_gpu = n_unit = n_128 = 0
-            pas = 1 << int(os.environ.get("AG_PAS", "31"))   # couples par appel du noyau (2^28 avant : 8 % plus lent)
+            # couples par appel du noyau : 2^28. Avec 2^31 (8 % plus rapide), un appel peut durer plus que le delai du
+            # chien de garde de Windows (TDR) sur une carte qui sert aussi a l affichage : la carte est reinitialisee et,
+            # sous WSL, le programme reste suspendu (evenement nvlddmkm 153). AG_PAS=31 pour une carte dediee au calcul.
+            pas = 1 << int(os.environ.get("AG_PAS", "28"))
             t_ = 0
             try:
                 while t_ < tot:

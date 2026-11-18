@@ -196,6 +196,12 @@ integers. A `G` is handled by the kernel when
 
 Outside this domain the standard C path (GMP) is used; it is far slower.
 
+**Display card and Windows watchdog.** The kernel is called on slices of `2^28` pairs. On a card that also
+drives the display, Windows resets the GPU when one call lasts more than about 2 seconds (TDR); under WSL the
+program then hangs instead of getting an error (event `nvlddmkm` 153 in the Windows event log). Slices of
+`2^31` pairs are about 8 % faster but can hit this limit on heavy `G`: use `AG_PAS=31` only on a card dedicated
+to computing.
+
 **Kernel layout.** Each GPU thread alternates "take the next pair `(u0, u2)`" and "test one `p`", so a
 thread never waits for the `p` loop of the 31 others in its warp. Measured on an RTX 50-series card:
 about `1.3 · 10^10` pairs per second, 1.7 times the previous kernel, with identical results.
