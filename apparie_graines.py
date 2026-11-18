@@ -271,12 +271,8 @@ def fenetres(Ycible, Ysrc, h, P0, decal=0):
     jx, lo, n = [], [], []
     for c in range(0, len(Ysrc), 1 << 20):
         t = h - Ysrc[c:c + (1 << 20)]
-        if P.get("psup"):                               # --p-sup : seulement p <= Psup (u0 >= t + t/Psup)
-            l_ = np.searchsorted(Ycible, t + t / P["psup"] * 0.999999 - 1e-15, side="right")
-        else:
-            l_ = np.searchsorted(Ycible, t - 1e-15, side="right")  # marge : y arrondis a ~1e-16 ; alpha exact trie
+        l_ = np.searchsorted(Ycible, t - 1e-15, side="right")  # marge : y arrondis a ~1e-16 ; alpha exact trie
         n_ = np.searchsorted(Ycible, t + t / P0 * 1.000001 + 1e-15, side="right") - l_
-        n_ = np.maximum(n_, 0)
         k_ = np.nonzero(n_)[0]
         jx.append((k_ + c + decal).astype(np.int32)); lo.append(l_[k_].astype(np.int32)); n.append(n_[k_].astype(np.int32))
     if not jx:
@@ -765,10 +761,6 @@ def main():
     ap.add_argument("--budget", type=float, default=60)
     ap.add_argument("--maxp", type=int, default=2000, help="valeurs de p essayees par couple au-dessus du plus petit "
                     "possible (les cycles connus ont p tout pres de ce minimum ; 20 suffit presque toujours)")
-    ap.add_argument("--p-sup", type=float, default=0, metavar="P1",
-                    help="seulement les couples dont le premier p est <= P1 (environ) : complement d'un run fait "
-                         "avec --p0 P1. Ex. --p0 5000 d'abord (5 fois plus rapide, ~40 %% des cycles), puis plus tard "
-                         "--p0 1000 --p-sup 5000 pour le reste, sans refaire les couples a p >= 5000")
     ap.add_argument("--u-deja", type=float, default=0, metavar="U0",
                     help="ne refait pas les couples (u0, u2) tous deux <= U0, deja faits par un run a --u U0 (memes "
                          "--p0, --K, --maxp) : en passant de 3e7 a 6e7, environ un quart du travail en moins")
@@ -879,8 +871,6 @@ def main():
     # reprise : G termines avec les memes parametres (une ligne « parametres <tab> G » par G)
     f_faits = args.out + ".faits"
     cle = f"u={int(args.u)},p0={int(args.p0)},K={args.K:g},maxp={args.maxp}"
-    if args.p_sup:
-        cle += f",psup={int(args.p_sup)}"
     cles = [cle]                                       # un G fait par un run complet au meme u est fait aussi
     if args.u_deja:
         cle += f",deja={int(args.u_deja)}"
@@ -927,7 +917,7 @@ def main():
         ncoeurs = os.cpu_count() or 1
     params = dict(U=U, P0=int(args.p0), K=args.K, budget=args.budget, sans_c=args.sans_c, maxp=args.maxp,
                   gpu=mode, fils=max(1, ncoeurs // max(1, args.jobs)),
-                  ext=args.etendu, ext_max=min(int(args.etendu_max), 2 ** 31 - 1), u_deja=int(args.u_deja), psup=int(args.p_sup))
+                  ext=args.etendu, ext_max=min(int(args.etendu_max), 2 ** 31 - 1), u_deja=int(args.u_deja))
     if args.etendu:
         global PREMIERS
         t_ = time.time()

@@ -146,13 +146,6 @@ The pairs below `U0` are only a quarter of the pairs when `u` doubles, but they 
 two runs together found exactly the cycles of the full run. Use it only for `G` values that were **completed**
 at `U0` (present in a `.faits` file with the same parameters); a `G` cut by the budget at `U0` would lose pairs.
 
-### Splitting the `p` range: `--p-sup`
-
-`--p-sup P1` keeps only the pairs whose prime `p` is about `<= P1`. It is the complement of a run made with
-`--p0 P1`: a run at `--p0 5000`, then later `--p0 1000 --p-sup 5000`, covers exactly what `--p0 1000` covers.
-(Observed on the cycles found so far: 59 % have `p < 5000`, while 80 % of the pairs have `p < 5000` at
-`--p0 1000`; a first pass at a higher `--p0` therefore finds cycles faster per hour.)
-
 ### Two free primes: `--etendu` (experimental)
 
 `--etendu V` searches seeds `a1 = G*u0*p` and `a2 = G*v*q` with `q` a large prime enumerated up to
