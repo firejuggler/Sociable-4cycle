@@ -17,7 +17,8 @@
 // les p avec 2^63 <= E <= K*G^2/S < 2^127 sont testes en 128 bits et rendus avec le bit 63 leve.
 // Un couple hors domaine (alpha >= 2^96, P0 >= 2^30, p >= 2^62) est rendu avec p = 0 : Python le fait en C.
 //
-// GPU :  nvcc -O3 -arch=sm_120 -Xcompiler -fPIC -shared -o libapparie_gpu.so apparie_gpu.cu
+// GPU :  nvcc -O3 -arch=sm_120 -maxrregcount=64 -Xcompiler -fPIC -shared -o libapparie_gpu.so apparie_gpu.cu
+//         (-maxrregcount=64 : 96 registres par fil sinon, occupation 33 % ; mesure RTX 50 : 1,32 fois plus rapide)
 // CPU :  g++ -O3 -fopenmp -fPIC -shared -x c++ -o libapparie_cpu.so apparie_gpu.cu   (controle)
 
 #include <stdint.h>
@@ -161,14 +162,30 @@ HD bool div_petit64(uint64_t n, uint64_t a, uint64_t *q, uint64_t *r) {
 // mode : 0 = pas de couple en cours, 1 = E < 2^63 (64 bits), 2 = 2^63 <= E <= Evrai (128 bits, hybride).
 struct Etat { int mode, v2X, v2L; uint64_t a, p, c, xl, xh, g0; u128 E, al; };
 
+HD u128 mul64x32(uint64_t a, uint32_t b) {         // a * b exact (< 2^96), en deux produits 32 x 32 -> 64
+    uint64_t lo = (uint64_t)(uint32_t)a * b;
+    uint64_t hi = (a >> 32) * (uint64_t)b;
+    return ((u128)hi << 32) + lo;
+}
+
 template <typename F>
 HD void init_couple(int64_t u0, int64_t s0, int64_t u2, uint64_t G, uint64_t s2, uint64_t P0, uint64_t Emax,
                     u128 Evrai, i128 A, i128 B, Etat &e, F emit) {
     // A = G*u2 - S*s2 et B = G*s2 ne dependent que de u2 : calcules une fois par fenetre par l'appelant
     // (beta = s0*A, alpha = beta + u0*B).
     e.mode = 0;
-    i128 be = A * s0;
-    i128 al = be + B * u0;
+    i128 be, al;
+    if (A < 0 && !((u128)(-A) >> 64) && B >= 0 && !((u128)B >> 64) && !((uint64_t)s0 >> 32) && !((uint64_t)u0 >> 32)) {
+        // cas courant (petits G) : |A|, B sur 64 bits et s0, u0 sur 32 bits -> deux produits 64 x 32 bits
+        // en mots de 32 bits (2 multiplications machine chacun sur GPU, au lieu d'un produit 128 x 64 emule)
+        u128 x = mul64x32((uint64_t)(-A), (uint32_t)s0);
+        u128 y = mul64x32((uint64_t)B, (uint32_t)u0);
+        be = -(i128)x;
+        al = (i128)y - (i128)x;
+    } else {
+        be = A * s0;
+        al = be + B * u0;
+    }
     if (al <= 0 || be >= 0) return;
     u128 nb = (u128)(-be);
     uint64_t a, pmin;
@@ -325,8 +342,8 @@ HD void voie_debut(Voie &v, int voie, int64_t b, int64_t saut, int64_t tuile, in
     v.fin = v.epuise ? 0 : (b + tuile < t1 ? b + tuile : t1);
     v.u0 = v.s0 = v.u2 = v.s2 = 0; v.A = v.B = 0;
 }
-template <typename F>
-HD void voie_tour(Voie &v, unsigned m, int64_t tuile, const int64_t *U, const int64_t *Sg, const int32_t *jx,
+template <typename F, typename TU>
+HD void voie_tour(Voie &v, unsigned m, int64_t tuile, const TU *U, const TU *Sg, const int32_t *jx,
                   const int32_t *lo, const int64_t *cs, int nw, int64_t G, int64_t S, uint64_t P0,
                   uint64_t maxp, uint64_t Emax, u128 Evrai, F emit) {
     int64_t dispo = v.fin - v.suiv;
@@ -379,9 +396,11 @@ extern "C" void ag_emax_vrai(uint64_t hi, uint64_t lo) { hEvrai = ((u128)hi << 6
 #define TUILE ((int64_t)32 * 64)                 // couples par tuile de warp (64 par fil)
 
 static int64_t *dU, *dS, *dcs; static int32_t *djx, *dlo; static Sortie *dout; static int *dno;
+static int32_t *dU32, *dS32; static int h32 = 0;     // u et sigma(u) sur 32 bits quand ils y tiennent : trafic memoire / 2
 static unsigned long long *dnt, *dn2; static int dcap = 0;
 
-__global__ void k_scan(int64_t t0, int64_t t1, const int64_t *U, const int64_t *Sg, const int32_t *jx,
+template <typename TU>
+__global__ void k_scan(int64_t t0, int64_t t1, const TU *U, const TU *Sg, const int32_t *jx,
                        const int32_t *lo, const int64_t *cs, int nw, int64_t G, int64_t S, uint64_t P0,
                        uint64_t maxp, uint64_t Emax, Sortie *out, int cap, int *no, unsigned long long *nt,
                        unsigned long long *n2, uint64_t Evhi, uint64_t Evlo) {
@@ -413,12 +432,29 @@ extern "C" int ag_charger(const int64_t *U, const int64_t *Sg, int nu, const int
                           const int64_t *cs, int nw, int64_t G, int64_t S, uint64_t P0, uint64_t maxp,
                           uint64_t Emax, int cap) {
     hG = G; hS = S; hP0 = P0; hmaxp = maxp; hEmax = Emax; hnw = nw; hEvrai = 0; (void)nu; dcap = cap;
-    CK(cudaMalloc(&dU, (size_t)nu * 8)); CK(cudaMalloc(&dS, (size_t)nu * 8));
+    dU = dS = NULL; dU32 = dS32 = NULL;
+    // u et sigma(u) sur 32 bits s'ils y tiennent tous (u <= 2^31 : toujours vrai pour --u <= 2e9 et
+    // sigma(u) < 2^31 pour u <= ~3e8) : le noyau lit alors 8 octets par couple au lieu de 16
+    h32 = 1;
+    for (int k = 0; k < nu && h32; k++)
+        if (U[k] < 0 || U[k] > 2147483647LL || Sg[k] < 0 || Sg[k] > 2147483647LL) h32 = 0;
+    if (h32) {
+        int32_t *t = (int32_t *)malloc((size_t)(nu ? nu : 1) * 4);
+        if (!t) return -1;
+        CK(cudaMalloc(&dU32, (size_t)nu * 4)); CK(cudaMalloc(&dS32, (size_t)nu * 4));
+        for (int k = 0; k < nu; k++) t[k] = (int32_t)U[k];
+        CK(cudaMemcpy(dU32, t, (size_t)nu * 4, cudaMemcpyHostToDevice));
+        for (int k = 0; k < nu; k++) t[k] = (int32_t)Sg[k];
+        CK(cudaMemcpy(dS32, t, (size_t)nu * 4, cudaMemcpyHostToDevice));
+        free(t);
+    } else {
+        CK(cudaMalloc(&dU, (size_t)nu * 8)); CK(cudaMalloc(&dS, (size_t)nu * 8));
+        CK(cudaMemcpy(dU, U, (size_t)nu * 8, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dS, Sg, (size_t)nu * 8, cudaMemcpyHostToDevice));
+    }
     CK(cudaMalloc(&djx, (size_t)nw * 4)); CK(cudaMalloc(&dlo, (size_t)nw * 4)); CK(cudaMalloc(&dcs, (size_t)nw * 8));
     CK(cudaMalloc(&dout, (size_t)cap * sizeof(Sortie))); CK(cudaMalloc(&dno, sizeof(int)));
     CK(cudaMalloc(&dnt, sizeof(unsigned long long))); CK(cudaMalloc(&dn2, sizeof(unsigned long long)));
-    CK(cudaMemcpy(dU, U, (size_t)nu * 8, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dS, Sg, (size_t)nu * 8, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(djx, jx, (size_t)nw * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dlo, lo, (size_t)nw * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dcs, cs, (size_t)nw * 8, cudaMemcpyHostToDevice));
@@ -434,8 +470,12 @@ extern "C" int ag_scan(int64_t t0, int64_t t1, int32_t *oi, int32_t *oj, uint64_
     // blocs de 256 fils = 8 warps = 8 tuiles par tour de grille
     int64_t nb64 = (m + 8 * TUILE - 1) / (8 * TUILE);
     int nb = nb64 > 65536 ? 65536 : (nb64 < 1 ? 1 : (int)nb64);
-    k_scan<<<nb, 256>>>(t0, t1, dU, dS, djx, dlo, dcs, hnw, hG, hS, hP0, hmaxp, hEmax, dout, dcap, dno, dnt, dn2,
-                         (uint64_t)(hEvrai >> 64), (uint64_t)hEvrai);
+    if (h32)
+        k_scan<<<nb, 256>>>(t0, t1, (const int32_t *)dU32, (const int32_t *)dS32, djx, dlo, dcs, hnw, hG, hS, hP0, hmaxp,
+                             hEmax, dout, dcap, dno, dnt, dn2, (uint64_t)(hEvrai >> 64), (uint64_t)hEvrai);
+    else
+        k_scan<<<nb, 256>>>(t0, t1, (const int64_t *)dU, (const int64_t *)dS, djx, dlo, dcs, hnw, hG, hS, hP0, hmaxp,
+                             hEmax, dout, dcap, dno, dnt, dn2, (uint64_t)(hEvrai >> 64), (uint64_t)hEvrai);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
     int no; unsigned long long nt;
     CK(cudaMemcpy(&no, dno, sizeof(int), cudaMemcpyDeviceToHost));
@@ -452,7 +492,7 @@ extern "C" int ag_scan(int64_t t0, int64_t t1, int32_t *oi, int32_t *oj, uint64_
 }
 
 extern "C" void ag_liberer(void) {
-    cudaFree(dU); cudaFree(dS); cudaFree(djx); cudaFree(dlo); cudaFree(dcs); cudaFree(dout); cudaFree(dno);
+    cudaFree(dU); cudaFree(dS); cudaFree(dU32); cudaFree(dS32); cudaFree(djx); cudaFree(dlo); cudaFree(dcs); cudaFree(dout); cudaFree(dno);
     cudaFree(dnt); cudaFree(dn2);
 }
 

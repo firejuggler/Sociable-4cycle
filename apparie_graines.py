@@ -257,18 +257,73 @@ def _chercher(g):
         # passer tout le G sur CPU (des minutes), on borne E a 2^63 - 1 : D <= S * (2^63 - 1) au lieu de K G^2.
         Emax = (1 << 63) - 1
         st["emax_borne"] = 1
-    # fenetre de u0 pour chaque u2, par tranches ; on ne garde que les u2 (indices jx) qui ont des partenaires
+    if P.get("ext"):                                   # --etendu : u2 = v*q (grand premier q), u0 <= U
+        return _chercher_etendu(g, G, Gv, S, h, Uu, Ss, Y, Emax, Evrai, st, cyc)
+    if P.get("u_deja"):                                # --u-deja : sans les couples deja faits a un u plus petit
+        return _chercher_suite(g, G, Gv, S, h, Uu, Ss, Y, Emax, Evrai, st, cyc)
+    jx, lo, n = fenetres(Y, Y, h, P0)
+    return _passe(g, G, Gv, S, Uu, Ss, jx, lo, n, Emax, Evrai, st, cyc, time.time())
+
+
+def fenetres(Ycible, Ysrc, h, P0, decal=0):
+    """Pour chaque u2 (y = Ysrc[k]) : fenetre [lo, lo + n) des u0 dans Ycible (trie), indices k + decal ;
+    seuls les u2 qui ont des partenaires sont gardes."""
     jx, lo, n = [], [], []
-    for c in range(0, len(Y), 1 << 20):
-        t = h - Y[c:c + (1 << 20)]
-        l_ = np.searchsorted(Y, t - 1e-15, side="right")  # marge : y arrondis a ~1e-16 ; alpha exact trie
-        n_ = np.searchsorted(Y, t + t / P0 * 1.000001 + 1e-15, side="right") - l_
+    for c in range(0, len(Ysrc), 1 << 20):
+        t = h - Ysrc[c:c + (1 << 20)]
+        if P.get("psup"):                               # --p-sup : seulement p <= Psup (u0 >= t + t/Psup)
+            l_ = np.searchsorted(Ycible, t + t / P["psup"] * 0.999999 - 1e-15, side="right")
+        else:
+            l_ = np.searchsorted(Ycible, t - 1e-15, side="right")  # marge : y arrondis a ~1e-16 ; alpha exact trie
+        n_ = np.searchsorted(Ycible, t + t / P0 * 1.000001 + 1e-15, side="right") - l_
+        n_ = np.maximum(n_, 0)
         k_ = np.nonzero(n_)[0]
-        jx.append((k_ + c).astype(np.int32)); lo.append(l_[k_].astype(np.int32)); n.append(n_[k_].astype(np.int32))
-    jx, lo, n = np.concatenate(jx), np.concatenate(lo), np.concatenate(n)
+        jx.append((k_ + c + decal).astype(np.int32)); lo.append(l_[k_].astype(np.int32)); n.append(n_[k_].astype(np.int32))
+    if not jx:
+        return (np.zeros(0, np.int32),) * 3
+    return np.concatenate(jx), np.concatenate(lo), np.concatenate(n)
+
+
+def _chercher_suite(g, G, Gv, S, h, Uu, Ss, Y, Emax, Evrai, st, cyc):
+    """--u-deja Ud : seulement les couples (u0, u2) dont AU MOINS UN depasse Ud. Les couples ou les deux sont
+    <= Ud ont ete faits par un run precedent a --u Ud (memes p0, K, maxp) : ils ne sont pas refaits.
+      passe A : u2 > Ud, u0 quelconque ;  passe B : u2 <= Ud, u0 > Ud."""
+    Ud, P0 = P["u_deja"], P["P0"]
+    t0 = time.time()
+    haut = Uu > Ud
+    total = dict(st)
+
+    def fusion(st1):
+        for k, x in st1.items():
+            total[k] = total.get(k, 0) + x if k not in ("incomplet", "gpu", "noyau_cpu", "emax_hybride", "emax_borne") \
+                else max(total.get(k, 0), x)
+
+    ia = np.flatnonzero(haut).astype(np.int64)
+    jx, lo, n = fenetres(Y, Y[ia], h, P0)
+    if len(jx):
+        st1 = dict(couples=0, p_testes=0, th2=0, premiers=0, incomplet=0)
+        # u2 = Uu[ia[jx]] : tableau etendu [Uu, Uu[ia]] pour que jx designe u2
+        _passe(g, G, Gv, S, np.concatenate([Uu, Uu[ia]]), np.concatenate([Ss, Ss[ia]]),
+               (jx + len(Uu)).astype(np.int32), lo, n, Emax, Evrai, st1, cyc, t0)
+        fusion(st1)
+    if not total.get("incomplet"):
+        Uh, Sh, Yh = Uu[haut], Ss[haut], Y[haut]
+        ib = np.flatnonzero(~haut)
+        jx, lo, n = fenetres(Yh, Y[ib], h, P0)
+        if len(jx):
+            st1 = dict(couples=0, p_testes=0, th2=0, premiers=0, incomplet=0)
+            _passe(g, G, Gv, S, np.concatenate([Uh, Uu[ib]]), np.concatenate([Sh, Ss[ib]]),
+                   (jx + len(Uh)).astype(np.int32), lo, n, Emax, Evrai, st1, cyc, t0)
+            fusion(st1)
+    cyc[:] = list({repr(c): c for c in cyc}.values())
+    return g, cyc, total
+
+
+def _passe(g, G, Gv, S, Uu, Ss, jx, lo, n, Emax, Evrai, st, cyc, t0, noyau_seul=False):
+    """Couples (u0 = Uu[lo[w] + k], u2 = Uu[jx[w]]), k < n[w] : crible des p puis theoremes 2 et 1."""
+    U, P0, K, budget = P["U"], P["P0"], P["K"], P["budget"]
     tot = int(n.sum(dtype=np.int64))
     st["couples"] = tot
-    t0 = time.time()
 
     def paquets(taille=1 << 20):
         """Couples (I = u0, J = u2) par paquets d'au plus ~taille : jamais tous en memoire (un G peut en
@@ -352,6 +407,9 @@ def _chercher(g):
             bG, bS = int(Gv).bit_length(), int(S).bit_length()
             bu, bs = int(Uu.max()).bit_length(), int(Ss.max()).bit_length()
             dans = bu + bs + max(bG + bu, bS + bs) <= 125 and bG + bs + 2 * bu + 1 <= 125 and bu <= 31 and bs <= 33
+        if noyau_seul and not dans:
+            st["hors_noyau"] = 1                           # --etendu : pas de repli sur le chemin C (trop lent)
+            return g, cyc, st
         if dans:
             Lg = gp[0]
             st["gpu" if gp[2] else "noyau_cpu"] = 1
@@ -455,6 +513,129 @@ def _chercher(g):
             cs, _ = B.theoreme1(f1, f2, 10 ** 6, (a1, sa1, a2, sa2))
             cyc += cs
     return g, cyc, st
+
+
+PREMIERS = None     # premiers <= --etendu-max (uint32), calcules une fois (herites au fork)
+
+
+def premiers_jusqua(X):
+    """Tous les premiers <= X (crible segmente numpy), en uint32."""
+    r = isqrt(X) + 1
+    c = np.ones(r + 1, dtype=bool); c[:2] = False
+    for i in range(2, isqrt(r) + 1):
+        if c[i]:
+            c[i * i::i] = False
+    base = np.flatnonzero(c)
+    out = [base[base <= X].astype(np.uint32)]
+    pas = 1 << 24
+    for a in range(r + 1, X + 1, pas):
+        b = min(X + 1, a + pas)
+        seg = np.ones(b - a, dtype=bool)
+        for p in base:
+            p = int(p)
+            if p * p >= b:
+                break
+            seg[(-a) % p::p] = False
+        out.append((np.flatnonzero(seg) + a).astype(np.uint32))
+    return np.concatenate(out)
+
+
+def garder_lisses(Pr, Bl):
+    """Les premiers q de Pr (uint32) tels que q + 1 n'a que des facteurs premiers <= Bl.
+    (Dans les cycles connus a deux premiers libres, 84 % des grands premiers ont q + 1 1000-lisse :
+    sigma(q) = q + 1 doit partager beaucoup de facteurs avec sigma du reste.)"""
+    petits = [int(p) for p in premiers_jusqua(Bl)]
+    out = []
+    for a in range(0, len(Pr), 1 << 22):
+        m = Pr[a:a + (1 << 22)].astype(np.uint32) + np.uint32(1)
+        for p in petits:
+            p_ = np.uint32(p)
+            while True:
+                z = (m % p_) == 0
+                if not z.any():
+                    break
+                m[z] //= p_
+        out.append(Pr[a:a + (1 << 22)][m == 1])
+    return np.concatenate(out)
+
+
+def _chercher_etendu(g, G, Gv, S, h, Uu, Ss, Y, Emax, Evrai, st, cyc):
+    """--etendu V : graines a1 = G*u0*p (u0 <= U, p cherche comme d'habitude) et a2 = G*v*q, ou q est un
+    GRAND premier enumere (v <= V, U < v*q <= --etendu-max). Un premier libre de chaque cote : la forme
+    des cycles tires des paires amicales (1276 des 5553 4-cycles du catalogue), hors de portee du run
+    normal des que v*q > U. Les couples (u0, u2 <= U) du run normal ne sont PAS refaits ici.
+    Les v pairs sont ecartes si G est impair (un cycle ne melange pas les parites)."""
+    U, P0, V, X = P["U"], P["P0"], P["ext"], P["ext_max"]
+    N = len(Uu)
+    # domaine du noyau (voir _passe) avec bs <= bu + 2 : la borne de v*q est abaissee pour les gros G
+    bu = min(31, (121 - int(S).bit_length()) // 3, (122 - int(Gv).bit_length()) // 3)
+    X = min(X, (1 << bu) - 1)
+    st["ext_vq_max"] = X
+    if X <= U:
+        st["hors_noyau"] = 1
+        return g, cyc, st
+    t0 = time.time()
+    U64, S64 = Uu.astype(np.int64), Ss.astype(np.int64)
+    vs = [v for v in range(1, V + 1) if gcd(v, Gv) == 1 and (Gv % 2 == 0 or v % 2 == 1)]
+    sv = {v: int(SIG[v]) for v in vs} if SIG is not None and V < len(SIG) else \
+        {v: int(sympy.divisor_sigma(v)) for v in vs}
+    premiers_G = [q for q in G if q > 2]
+    total = dict(st)
+    cap = P.get("ext_tranche", 1 << 24)
+    tu, ts, ty, m = [], [], [], 0
+
+    def vider():
+        nonlocal tu, ts, ty, m
+        if not m:
+            return True
+        Ue, Se, Ye = np.concatenate(tu), np.concatenate(ts), np.concatenate(ty)
+        tu, ts, ty, m = [], [], [], 0
+        if int(Se.max()) >> (bu + 2):                      # sigma trop grand pour le noyau : ecarte (v tres abondant)
+            ok_ = Se < (1 << (bu + 2))
+            Ue, Se, Ye = Ue[ok_], Se[ok_], Ye[ok_]
+        t = h - Ye
+        l_ = np.searchsorted(Y, t - 1e-15, side="right")
+        n_ = np.searchsorted(Y, t + t / P0 * 1.000001 + 1e-15, side="right") - l_
+        k_ = np.nonzero(n_)[0]
+        total["ext_elements"] = total.get("ext_elements", 0) + len(Ue)
+        if not len(k_):
+            return True
+        Ue, Se = Ue[k_], Se[k_]                            # seuls les u2 qui ont des partenaires sont charges
+        jx = (N + np.arange(len(k_))).astype(np.int32)
+        st1 = dict(couples=0, p_testes=0, th2=0, premiers=0, incomplet=0)
+        _passe(g, G, Gv, S, np.concatenate([U64, Ue]), np.concatenate([S64, Se]), jx, l_[k_].astype(np.int32),
+               n_[k_].astype(np.int32), Emax, Evrai, st1, cyc, t0, noyau_seul=True)
+        for k, x in st1.items():
+            total[k] = total.get(k, 0) + x if k not in ("incomplet", "gpu", "noyau_cpu", "emax_hybride", "hors_noyau") \
+                else max(total.get(k, 0), x)
+        return not st1.get("incomplet") and not st1.get("hors_noyau")
+
+    fini = True
+    for v in vs:
+        qa, qb = max(U // v, V, P0), X // v                # v*q > U, q > V >= v (premier avec v), q <= X/v
+        if qb <= qa:
+            continue
+        # bornes en uint32 : avec un entier Python, numpy convertissait tout le tableau a chaque appel
+        q = PREMIERS[PREMIERS.searchsorted(np.uint32(qa), side="right"):
+                     PREMIERS.searchsorted(np.uint32(qb), side="right")]
+        for pg in premiers_G:
+            if qa < pg <= qb:
+                q = q[q != pg]
+        if not len(q):
+            continue
+        q = q.astype(np.int64)
+        tu.append(q * v); ts.append((q + 1) * sv[v]); ty.append((v / sv[v]) * (q / (q + 1.0)))
+        m += len(q)
+        if m >= cap and not vider():
+            fini = False
+            break
+    if fini and not vider():
+        fini = False
+    if not fini and not total.get("hors_noyau"):
+        total["incomplet"] = 1
+    if Evrai or True:
+        cyc[:] = list({repr(c): c for c in cyc}.values())
+    return g, cyc, total
 
 
 def cycles_de(G, Gv, S, u0, s0, u2, s2, p):
@@ -584,6 +765,26 @@ def main():
     ap.add_argument("--budget", type=float, default=60)
     ap.add_argument("--maxp", type=int, default=2000, help="valeurs de p essayees par couple au-dessus du plus petit "
                     "possible (les cycles connus ont p tout pres de ce minimum ; 20 suffit presque toujours)")
+    ap.add_argument("--p-sup", type=float, default=0, metavar="P1",
+                    help="seulement les couples dont le premier p est <= P1 (environ) : complement d'un run fait "
+                         "avec --p0 P1. Ex. --p0 5000 d'abord (5 fois plus rapide, ~40 %% des cycles), puis plus tard "
+                         "--p0 1000 --p-sup 5000 pour le reste, sans refaire les couples a p >= 5000")
+    ap.add_argument("--u-deja", type=float, default=0, metavar="U0",
+                    help="ne refait pas les couples (u0, u2) tous deux <= U0, deja faits par un run a --u U0 (memes "
+                         "--p0, --K, --maxp) : en passant de 3e7 a 6e7, environ un quart du travail en moins")
+    ap.add_argument("--etendu", type=int, default=0, metavar="V",
+                    help="graines a deux premiers libres (un par cote) : a1 = G*u0*p, u0 <= --u, et a2 = G*v*q "
+                         "avec v <= V et q grand premier, --u < v*q <= --etendu-max. Ne refait pas le run normal "
+                         "(couples u0, u2 <= --u) ; avancement note a part dans .faits. Noyau seulement (--gpu)")
+    ap.add_argument("--etendu-lisse", type=int, default=0, metavar="B",
+                    help="avec --etendu : seulement les premiers q tels que q+1 n'a que des facteurs <= B "
+                         "(ex. 1000 : 25 fois moins de premiers, 95 %% des cycles connus de cette forme ; "
+                         "permet un --etendu V bien plus grand). 0 = tous les premiers")
+    ap.add_argument("--etendu-premiers", default="", metavar="FICHIER",
+                    help="avec --etendu : seulement les premiers q de ce fichier (un par ligne), par exemple "
+                         "les grands premiers des graines de cycles connus")
+    ap.add_argument("--etendu-max", type=float, default=2 ** 31 - 1,
+                    help="borne de v*q (defaut et maximum du noyau : 2^31 - 1)")
     ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--recyclage", type=int, default=10, metavar="N",
                     help="chaque processus est remplace apres N G (memoire rendue au systeme ; avec --gpu, chaque "
@@ -678,8 +879,21 @@ def main():
     # reprise : G termines avec les memes parametres (une ligne « parametres <tab> G » par G)
     f_faits = args.out + ".faits"
     cle = f"u={int(args.u)},p0={int(args.p0)},K={args.K:g},maxp={args.maxp}"
+    if args.p_sup:
+        cle += f",psup={int(args.p_sup)}"
+    cles = [cle]                                       # un G fait par un run complet au meme u est fait aussi
+    if args.u_deja:
+        cle += f",deja={int(args.u_deja)}"
+        cles.append(cle)
+    if args.etendu:                                    # run a part : n'interfere pas avec l'avancement normal
+        cle += f",etendu={args.etendu},vq={int(args.etendu_max)}"
+        if args.etendu_lisse:
+            cle += f",lisse={args.etendu_lisse}"
+        if args.etendu_premiers:
+            cle += f",premiers={os.path.basename(args.etendu_premiers)}"
     if os.path.exists(f_faits) and not args.refaire and not args.G:
-        faits = {l.rstrip("\n").split("\t", 1)[1] for l in open(f_faits, encoding="utf-8") if l.startswith(cle + "\t")}
+        faits = {l.rstrip("\n").split("\t", 1)[1] for l in open(f_faits, encoding="utf-8")
+                 if l.split("\t", 1)[0] in (cles if args.u_deja else [cle])}
         avant = len(Gs)
         Gs = [g for g in Gs if g not in faits]
         if avant != len(Gs):
@@ -712,7 +926,27 @@ def main():
     except AttributeError:
         ncoeurs = os.cpu_count() or 1
     params = dict(U=U, P0=int(args.p0), K=args.K, budget=args.budget, sans_c=args.sans_c, maxp=args.maxp,
-                  gpu=mode, fils=max(1, ncoeurs // max(1, args.jobs)))
+                  gpu=mode, fils=max(1, ncoeurs // max(1, args.jobs)),
+                  ext=args.etendu, ext_max=min(int(args.etendu_max), 2 ** 31 - 1), u_deja=int(args.u_deja), psup=int(args.p_sup))
+    if args.etendu:
+        global PREMIERS
+        t_ = time.time()
+        if args.etendu_premiers:
+            qs = {int(l.split()[0]) for l in open(args.etendu_premiers) if l.strip() and l.split()[0].isdigit()}
+            PREMIERS = np.array(sorted(q for q in qs if q <= params["ext_max"] and gmpy2.is_prime(q)), dtype=np.uint32)
+        else:
+            PREMIERS = premiers_jusqua(params["ext_max"])
+        if args.etendu_lisse:                          # calcul long (minutes pour B = 1000) : garde sur disque
+            cache = f"premiers_lisses_{args.etendu_lisse}_{params['ext_max']}" \
+                    + (f"_{os.path.basename(args.etendu_premiers)}" if args.etendu_premiers else "") + ".npy"
+            if os.path.exists(cache):
+                PREMIERS = np.load(cache)
+            else:
+                PREMIERS = garder_lisses(PREMIERS, args.etendu_lisse)
+                np.save(cache, PREMIERS)
+        print(f"[i] --etendu {args.etendu} : {len(PREMIERS):,} premiers q <= {params['ext_max']:,}"
+              + (f" avec q+1 {args.etendu_lisse}-lisse" if args.etendu_lisse else "")
+              + (f" (liste {args.etendu_premiers})" if args.etendu_premiers else "") + f" ({time.time() - t_:.0f} s)", flush=True)
     P["sans_c"] = args.sans_c
     print("[i] module C : " + ("oui" if lib_c() else "non (Python pur, plus lent)"), flush=True)
     if mode:

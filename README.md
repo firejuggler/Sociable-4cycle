@@ -54,8 +54,12 @@ gcc -O2 -shared -fPIC -o libborho4c.so borho4c.c -lgmp -lm
 Build the GPU core loop:
 
 ```bash
-nvcc -O3 -arch=sm_120 -Xcompiler -fPIC -shared -o libapparie_gpu.so apparie_gpu.cu
+nvcc -O3 -arch=sm_120 -maxrregcount=64 -Xcompiler -fPIC -shared -o libapparie_gpu.so apparie_gpu.cu
 ```
+
+`-maxrregcount=64` matters: without it the kernel uses 96 registers per thread, which limits occupancy to 33 %
+(profiled with Nsight Compute: the kernel is latency-bound, not memory-bound). With 64 registers it ran
+1.3 to 1.5 times faster on an RTX 50-series card, with identical results; 48 or 40 registers gave no further gain.
 
 For the CPU core loop:
 
@@ -125,6 +129,34 @@ Example:
 ```bash
 python3 apparie_graines.py --depuis-paires c2_22.txt.gz --impairs --hmin 1.85 --exclure G_*.txt ag_*.txt.faits
 ```
+
+### Raising `u` without redoing work: `--u-deja`
+
+`--u-deja U0` skips every pair (u0, u2) with **both** cofactors `<= U0`: they were already searched by a run
+at `--u U0` with the same `--p0`, `--K` and `--maxp`. Only pairs where at least one cofactor exceeds `U0` are done.
+
+```bash
+python3 apparie_graines.py --liste G.txt --u 1.2e8 --u-deja 6e7 --gpu --out ag_u12e7.txt
+```
+
+The pairs below `U0` are only a quarter of the pairs when `u` doubles, but they are the most expensive ones
+(they have the most values of `p` to test): going from `5e5` to `1e6` this way took 47 % less time, and the
+two runs together found exactly the cycles of the full run. Use it only for `G` values that were **completed**
+at `U0` (present in a `.faits` file with the same parameters); a `G` cut by the budget at `U0` would lose pairs.
+
+### Splitting the `p` range: `--p-sup`
+
+`--p-sup P1` keeps only the pairs whose prime `p` is about `<= P1`. It is the complement of a run made with
+`--p0 P1`: a run at `--p0 5000`, then later `--p0 1000 --p-sup 5000`, covers exactly what `--p0 1000` covers.
+(Observed on the cycles found so far: 59 % have `p < 5000`, while 80 % of the pairs have `p < 5000` at
+`--p0 1000`; a first pass at a higher `--p0` therefore finds cycles faster per hour.)
+
+### Two free primes: `--etendu` (experimental)
+
+`--etendu V` searches seeds `a1 = G*u0*p` and `a2 = G*v*q` with `q` a large prime enumerated up to
+`--etendu-max` (default `2^31 - 1`), `v <= V`, `--u < v*q`. This is the shape of the Borho cycles obtained from
+amicable pairs (1276 of the 5553 4-cycles of the catalogue). `--etendu-premiers FILE` restricts `q` to a list of
+primes, `--etendu-lisse B` to primes with `q + 1` B-smooth. In practice this mode only re-found known cycles.
 
 ### Resuming a run
 

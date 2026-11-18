@@ -780,6 +780,9 @@ int croise_init(int nb, const char **facs, const int *paires) {
     return 0;
 }
 
+static int JMIN = 0;           /* croise.py --mixte : seules les graines j >= JMIN (paires anciennes) */
+void croise_jmin(int j) { JMIN = j > 0 ? j : 0; }
+
 int croise_tranche(int i0, int i1, long max_div, int *stats, int *out, int max_out) {
     if (!GR) return -1;
     if (!ctxc_ok) { ctx_init(&CTXC); ctxc_ok = 1; }
@@ -791,7 +794,7 @@ int croise_tranche(int i0, int i1, long max_div, int *stats, int *out, int max_o
         graine_t *A = &GR[i];
         mpz_sub(t1, A->b.s, A->b.v);
         mpz_mul(h, A->b.s, A->b.v);
-        for (int j = i + 1; j < NGR; j++) {
+        for (int j = (i + 1 > JMIN ? i + 1 : JMIN); j < NGR; j++) {
             graine_t *Bq = &GR[j];
             if (Bq->paire == A->paire) continue;       /* meme paire : c'est le travail de borho4 */
             stats[0]++;
