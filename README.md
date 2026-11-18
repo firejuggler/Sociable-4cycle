@@ -210,13 +210,14 @@ scheduling to be checked without a GPU.
 
 ### Memory (RAM and GPU)
 
-Memory grows linearly with `--u`. Measured at `u = 1.2e8` with `--jobs 1` (WSL, 16 GB machine, RTX 5070 with
-12 GB); the `6e7` line is an estimate (half of it):
+Memory grows linearly with `--u`. Peak RAM used by a run with `--jobs 1` (system and other programs excluded;
+measured on Linux with the CPU kernel, which builds the same arrays as the GPU run; the `1.2e8` figure matches
+what was observed on a 16 GB WSL machine with an RTX 5070):
 
-| `--u` | main process | computing process, during one `G` | total RAM | GPU memory |
-|---:|---:|---:|---:|---:|
-| `6e7` | about 2 GB | about 4 GB | about 4-5 GB | under 1 GB |
-| `1.2e8` | about 3.6 GB | about 4-5 GB more | 7.3-7.9 GB | about 1.7 GB |
+| `--u` | without `--u-deja` | with `--u-deja` (`U0 = u/2`) | GPU memory |
+|---:|---:|---:|---:|
+| `6e7` | about 2.9 GB | about 3.9 GB | about 1 GB (estimate) |
+| `1.2e8` | - | about 7.7 GB | about 1.7 GB |
 
 - The **main process** keeps, once for the whole run, the table of `sigma(u)` for `u <= U`, the cofactors sorted
   by `u/sigma(u)` and one mask per small prime: roughly 30 bytes per value of `u`.
