@@ -1,4 +1,3 @@
-[README_apparie.txt](https://github.com/user-attachments/files/34837372/README_apparie.txt)
 # Sociable-4cycle
 A script to search for sociable 4-cycles (aliquot cycles of length 4).
 
@@ -56,6 +55,9 @@ Build the GPU core loop:
 ```bash
 nvcc -O3 -arch=sm_120 -maxrregcount=64 -Xcompiler -fPIC -shared -o libapparie_gpu.so apparie_gpu.cu
 ```
+
+`sm_120` is the architecture of RTX 50-series cards: replace it with yours (`sm_89` for RTX 40, `sm_86` for
+RTX 30...), or use `-arch=native` to compile for the card present in the machine.
 
 `-maxrregcount=64` matters: without it the kernel uses 96 registers per thread, which limits occupancy to 33 %
 (profiled with Nsight Compute: the kernel is latency-bound, not memory-bound). With 64 registers it ran
