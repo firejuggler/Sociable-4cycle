@@ -208,6 +208,28 @@ about `1.3 · 10^10` pairs per second, 1.7 times the previous kernel, with ident
 Compiling with `-DAG_SIMU` (CPU) runs the same warp logic on 32 simulated lanes, which allows the
 scheduling to be checked without a GPU.
 
+### Memory (RAM and GPU)
+
+Memory grows linearly with `--u`. Measured at `u = 1.2e8` with `--jobs 1` (WSL, 16 GB machine, RTX 5070 with
+12 GB); the `6e7` line is an estimate (half of it):
+
+| `--u` | main process | computing process, during one `G` | total RAM | GPU memory |
+|---:|---:|---:|---:|---:|
+| `6e7` | about 2 GB | about 4 GB | about 4-5 GB | under 1 GB |
+| `1.2e8` | about 3.6 GB | about 4-5 GB more | 7.3-7.9 GB | about 1.7 GB |
+
+- The **main process** keeps, once for the whole run, the table of `sigma(u)` for `u <= U`, the cofactors sorted
+  by `u/sigma(u)` and one mask per small prime: roughly 30 bytes per value of `u`.
+- The **computing process** builds, for each `G`, the cofactors coprime with `G`, the windows of partners and the
+  arrays sent to the card. With `--u-deja` the cofactors above `U0` are added once more.
+- Memory freed after a `G` is not always returned to the system. The computing process is replaced every
+  `--recyclage N` `G` (default 10); **at large `u`, use `--recyclage 1`**, otherwise the process grows from one `G`
+  to the next. Without it, a run at `u = 1.2e8` saturated 16 GB of RAM and started swapping after about ten `G`.
+- **Each extra job (`--jobs`) adds a full computing process**: at `u = 1.2e8`, `--jobs 2` does not fit in 16 GB.
+- Do not run other heavy programs in parallel (`croise.py`, `paires_connues.py`...): under WSL, Linux and Windows
+  share the same RAM. Check with `free -h`: if `available` drops below 1 GB or the swap grows, stop the run
+  (Ctrl-C keeps every completed `G` in `.faits`) and restart it with `--recyclage 1`.
+
 ## 8. Practical advice (from experience)
 
 These recommendations reflect observed runs and the current implementation; they are practical
