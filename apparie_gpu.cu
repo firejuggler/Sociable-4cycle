@@ -109,7 +109,7 @@ HD bool theoreme2(uint64_t G, uint64_t u0, uint64_t s0, uint64_t u2, uint64_t s2
 }
 
 // ---- suite 128 bits (mode hybride) : E entre 2^63 et Evrai = K*G^2/S < 2^127 ----
-// redc128 : (T2:T1:T0) * 2^-64 mod n, n impair < 2^127, T < n * 2^64 (ou T < 2^128 : resultat < 2^63 + n) ;
+// redc128 : (T2:T1:T0) * 2^-64 mod n, n impair < 2^127, T < n * 2^64 (ou T < 2^127, cas de |X| d'un i128 : resultat < 2^63 + n, a reduire par l'appelant) ;
 // q = ninv64(poids faible de n). Un seul pas de Montgomery : le facteur 2^-64 est inversible modulo n,
 // donc le test « = 0 » reste exact, comme dans la version 64 bits.
 HD u128 redc128(uint64_t T0, uint64_t T1, uint64_t T2, u128 n, uint64_t q) {
@@ -428,11 +428,21 @@ __global__ void k_scan(int64_t t0, int64_t t1, const TU *U, const TU *Sg, const 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
     fprintf(stderr, "CUDA : %s (%s:%d)\n", cudaGetErrorString(e_), __FILE__, __LINE__); return -1; } } while (0)
 
+// libere tout ce qui a ete alloue (pointeurs remis a NULL : appel sans risque a tout moment). Appele au debut
+// de ag_charger : si une allocation avait echoue au G precedent (ag_charger rend -1 sans ag_liberer), la memoire
+// de la carte n'est plus perdue
+static void liberer_tout(void) {
+    void **pp[] = {(void **)&dU, (void **)&dS, (void **)&dU32, (void **)&dS32, (void **)&djx, (void **)&dlo,
+                   (void **)&dcs, (void **)&dout, (void **)&dno, (void **)&dnt, (void **)&dn2};
+    for (unsigned k = 0; k < sizeof(pp) / sizeof(pp[0]); k++)
+        if (*pp[k]) { cudaFree(*pp[k]); *pp[k] = NULL; }
+}
+
 extern "C" int ag_charger(const int64_t *U, const int64_t *Sg, int nu, const int32_t *jx, const int32_t *lo,
                           const int64_t *cs, int nw, int64_t G, int64_t S, uint64_t P0, uint64_t maxp,
                           uint64_t Emax, int cap) {
     hG = G; hS = S; hP0 = P0; hmaxp = maxp; hEmax = Emax; hnw = nw; hEvrai = 0; (void)nu; dcap = cap;
-    dU = dS = NULL; dU32 = dS32 = NULL;
+    liberer_tout();
     // u et sigma(u) sur 32 bits s'ils y tiennent tous (u <= 2^31 : toujours vrai pour --u <= 2e9 et
     // sigma(u) < 2^31 pour u <= ~3e8) : le noyau lit alors 8 octets par couple au lieu de 16
     h32 = 1;
@@ -491,10 +501,7 @@ extern "C" int ag_scan(int64_t t0, int64_t t1, int32_t *oi, int32_t *oj, uint64_
     return no;
 }
 
-extern "C" void ag_liberer(void) {
-    cudaFree(dU); cudaFree(dS); cudaFree(dU32); cudaFree(dS32); cudaFree(djx); cudaFree(dlo); cudaFree(dcs); cudaFree(dout); cudaFree(dno);
-    cudaFree(dnt); cudaFree(dn2);
-}
+extern "C" void ag_liberer(void) { liberer_tout(); }
 
 #else   // ---- version CPU (OpenMP) : meme un_couple(), pour controle sans GPU ----
 
