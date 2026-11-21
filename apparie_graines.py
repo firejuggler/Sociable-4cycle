@@ -61,6 +61,7 @@ SIG = None          # table sigma(u), u <= U (heritee par les processus au fork)
 TRI = None          # (u, sigma(u), y = u/sigma(u)) tries par y, calcules une fois (herites au fork)
 PETITS = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47)
 MASQUES = {}        # q -> (u % q != 0) sur TRI[0], pour les petits premiers (herites au fork)
+SANS = []           # --sans-premiers : premiers exclus de toutes les graines u (et des G)
 
 
 def tri():
@@ -69,6 +70,12 @@ def tri():
     if TRI is None:
         u = np.arange(1, len(SIG), dtype=SIG.dtype)
         su = SIG[1:]
+        if SANS:                                       # --sans-premiers : graines premieres avec ces premiers
+            garde = np.ones(len(u), dtype=bool)
+            for q in SANS:
+                garde &= (u % q) != 0
+            u, su = u[garde], su[garde]
+            del garde
         y = u / su
         o = np.argsort(y, kind="stable")
         ty = np.int32 if len(SIG) < 2 ** 31 and int(su.max()) < 2 ** 31 else np.int64   # 32 bits : memoire / 2
@@ -283,36 +290,26 @@ def fenetres(Ycible, Ysrc, h, P0, decal=0):
 def _chercher_suite(g, G, Gv, S, h, Uu, Ss, Y, Emax, Evrai, st, cyc):
     """--u-deja Ud : seulement les couples (u0, u2) dont AU MOINS UN depasse Ud. Les couples ou les deux sont
     <= Ud ont ete faits par un run precedent a --u Ud (memes p0, K, maxp) : ils ne sont pas refaits.
-      passe A : u2 > Ud, u0 quelconque ;  passe B : u2 <= Ud, u0 > Ud."""
+    Une seule passe sur la carte, sur le tableau [Uu, Uh] (Uh = les u > Ud, dans le meme ordre des y) :
+      u2 > Ud  : fenetre des u0 dans Uu (tous les u0) ;
+      u2 <= Ud : fenetre des u0 dans Uh (les u0 > Ud seulement), indices decales de len(Uu).
+    Chaque couple (u0, u2) a au moins un terme > Ud est donc vu une fois et une seule."""
     Ud, P0 = P["u_deja"], P["P0"]
-    t0 = time.time()
     haut = Uu > Ud
-    total = dict(st)
-
-    def fusion(st1):
-        for k, x in st1.items():
-            total[k] = total.get(k, 0) + x if k not in ("incomplet", "gpu", "noyau_cpu", "emax_hybride", "emax_borne") \
-                else max(total.get(k, 0), x)
-
-    ia = np.flatnonzero(haut).astype(np.int64)
-    jx, lo, n = fenetres(Y, Y[ia], h, P0)
-    if len(jx):
-        st1 = dict(couples=0, p_testes=0, th2=0, premiers=0, incomplet=0)
-        # u2 = Uu[ia[jx]] : tableau etendu [Uu, Uu[ia]] pour que jx designe u2
-        _passe(g, G, Gv, S, np.concatenate([Uu, Uu[ia]]), np.concatenate([Ss, Ss[ia]]),
-               (jx + len(Uu)).astype(np.int32), lo, n, Emax, Evrai, st1, cyc, t0)
-        fusion(st1)
-    if not total.get("incomplet"):
-        Uh, Sh, Yh = Uu[haut], Ss[haut], Y[haut]
-        ib = np.flatnonzero(~haut)
-        jx, lo, n = fenetres(Yh, Y[ib], h, P0)
-        if len(jx):
-            st1 = dict(couples=0, p_testes=0, th2=0, premiers=0, incomplet=0)
-            _passe(g, G, Gv, S, np.concatenate([Uh, Uu[ib]]), np.concatenate([Sh, Ss[ib]]),
-                   (jx + len(Uh)).astype(np.int32), lo, n, Emax, Evrai, st1, cyc, t0)
-            fusion(st1)
+    ia = np.flatnonzero(haut)                          # u2 > Ud
+    ib = np.flatnonzero(~haut)                         # u2 <= Ud
+    Yh = Y[haut]
+    jxa, loa, na = fenetres(Y, Y[ia], h, P0)
+    jxb, lob, nb_ = fenetres(Yh, Y[ib], h, P0)
+    jx = np.concatenate([ia[jxa], ib[jxb]]).astype(np.int32)       # indices de u2 dans Uu
+    lo = np.concatenate([loa, lob + len(Uu)]).astype(np.int32)     # debuts des fenetres de u0 dans [Uu, Uh]
+    n = np.concatenate([na, nb_]).astype(np.int32)
+    if not len(jx):
+        return g, cyc, st
+    r = _passe(g, G, Gv, S, np.concatenate([Uu, Uu[haut]]), np.concatenate([Ss, Ss[haut]]), jx, lo, n,
+               Emax, Evrai, st, cyc, time.time())
     cyc[:] = list({repr(c): c for c in cyc}.values())
-    return g, cyc, total
+    return r
 
 
 def _passe(g, G, Gv, S, Uu, Ss, jx, lo, n, Emax, Evrai, st, cyc, t0, noyau_seul=False):
@@ -785,6 +782,9 @@ def main():
                     help="chaque processus est remplace apres N G (memoire rendue au systeme ; avec --gpu, chaque "
                          "remplacement recharge CUDA) ; a augmenter si les G sont rapides (ex. 100)")
     ap.add_argument("--out", default="apparie_cycles.txt")
+    ap.add_argument("--sans-premiers", default="", metavar="2,3,5",
+                    help="graines u (et G) sans ces premiers : cycles dont les graines et G evitent ces facteurs "
+                         "(ex. 2,3,5 pour des cycles premiers avec 30)")
     ap.add_argument("--sans-c", action="store_true", help="tout en Python (verification, plus lent)")
     ap.add_argument("--connus", nargs="*", default=[])
     ap.add_argument("--refaire", action="store_true", help="refaire aussi les G deja notes dans <out>.faits")
@@ -874,6 +874,8 @@ def main():
     # reprise : G termines avec les memes parametres (une ligne « parametres <tab> G » par G)
     f_faits = args.out + ".faits"
     cle = f"u={int(args.u)},p0={int(args.p0)},K={args.K:g},maxp={args.maxp}"
+    if args.sans_premiers:
+        cle += f",sans={args.sans_premiers.replace(',', '.')}"
     cles = [cle]                                       # un G fait par un run complet au meme u est fait aussi
     if args.u_deja:
         cle += f",deja={int(args.u_deja)}"
@@ -906,6 +908,12 @@ def main():
                 deja.add(int(m[0]))
     U = int(args.u)
     t0 = time.time()
+    if args.sans_premiers:
+        SANS[:] = sorted({int(x) for x in args.sans_premiers.replace(" ", "").split(",") if x})
+        avant = len(Gs)
+        Gs = [g for g in Gs if not any(q in B.parse(g) for q in SANS)]
+        if avant != len(Gs):
+            print(f"--sans-premiers {SANS} : {avant - len(Gs)} G ecarte(s) (divisibles par un premier exclu)")
     SIG = sigma_tab(U)
     tri()                                                  # une fois, avant le fork
     SIG = None                                             # plus utile : la table triee suffit

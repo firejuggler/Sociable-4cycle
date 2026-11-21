@@ -49,7 +49,7 @@ HD uint64_t powmod(uint64_t b, uint64_t e, uint64_t m) {
     return r;
 }
 
-HD bool premier64(uint64_t n) {                    // Miller-Rabin deterministe pour n < 2^64
+HD bool premier64_div(uint64_t n) {                // Miller-Rabin deterministe pour n < 2^64 (mulmod : division)
     if (n < 2) return false;
     const uint64_t pp[12] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37};
     for (int i = 0; i < 12; i++) { if (n % pp[i] == 0) return n == pp[i]; }
@@ -73,6 +73,14 @@ HD int ctz64(uint64_t x) {                         // x != 0
 #endif
 }
 
+HD int clz64(uint64_t x) {                         // x != 0
+#ifdef __CUDA_ARCH__
+    return __clzll((long long)x);
+#else
+    return __builtin_clzll(x);
+#endif
+}
+
 HD uint64_t ninv64(uint64_t n) {                   // -1/n mod 2^64, n impair (Newton, sans division)
     // variante de Dumas : y = 1 - n*x est eleve au carre en parallele des produits x*(1 + y), d'ou une
     // chaine de dependances plus courte que Newton (meme nombre de multiplications)
@@ -90,6 +98,38 @@ HD uint64_t redc(u128 T, uint64_t n, uint64_t q) {
     uint64_t m = (uint64_t)T * q;
     uint64_t t = (uint64_t)((T + (u128)m * n) >> 64);
     return t >= n ? t - n : t;
+}
+
+// Miller-Rabin deterministe (memes 12 bases) en arithmetique de Montgomery : que des multiplications. Sur GPU,
+// mulmod (u128 % u64) est une division logicielle : premier64_div coutait ~10^6 cycles par appel, et les
+// couples ou des dizaines de p passent le theoreme 2 bloquaient leur warp des dizaines de millions de cycles
+// (mesure : chrono AG_CHRONO). Pour n >= 2^63 (redc exige n < 2^63) : premier64_div.
+HD bool premier64(uint64_t n) {
+    if (n < 2) return false;
+    const uint64_t pp[12] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37};
+    for (int i = 0; i < 12; i++) { if (n % pp[i] == 0) return n == pp[i]; }
+    if (n >> 63) return premier64_div(n);
+    // ici n impair, 37 < n < 2^63
+    const uint64_t q = ninv64(n);
+    uint64_t un = (uint64_t)0 - n; un %= n;                        // R = 2^64 mod n (forme de Montgomery de 1)
+    uint64_t r2 = un;                                              // R^2 mod n par 64 doublements, sans division
+    for (int i = 0; i < 64; i++) { r2 <<= 1; if (r2 >= n) r2 -= n; }   // r2 < n < 2^63 : pas de debordement
+    const uint64_t moins_un = n - un;
+    uint64_t d = n - 1; int r = 0;
+    while ((d & 1) == 0) { d >>= 1; r++; }
+    for (int i = 0; i < 12; i++) {
+        uint64_t b = redc((u128)pp[i] * r2, n, q);                 // pp[i] < n
+        uint64_t x = un;
+        for (int k = 63 - clz64(d); k >= 0; k--) {       // puissance gauche-droite
+            x = redc((u128)x * x, n, q);
+            if ((d >> k) & 1) x = redc((u128)x * b, n, q);
+        }
+        if (x == un || x == moins_un) continue;
+        bool ok = false;
+        for (int k = 1; k < r; k++) { x = redc((u128)x * x, n, q); if (x == moins_un) { ok = true; break; } }
+        if (!ok) return false;
+    }
+    return true;
 }
 
 // theoreme 2 exact (comme apparie_couples2) : D = S*E divise (a1 - a2)*pgcd(sa1, sa2)*pgcd(a1, a2), avec
@@ -342,10 +382,10 @@ HD void voie_debut(Voie &v, int voie, int64_t b, int64_t saut, int64_t tuile, in
     v.fin = v.epuise ? 0 : (b + tuile < t1 ? b + tuile : t1);
     v.u0 = v.s0 = v.u2 = v.s2 = 0; v.A = v.B = 0;
 }
-template <typename F, typename TU>
+template <typename F, typename TU, typename N>
 HD void voie_tour(Voie &v, unsigned m, int64_t tuile, const TU *U, const TU *Sg, const int32_t *jx,
                   const int32_t *lo, const int64_t *cs, int nw, int64_t G, int64_t S, uint64_t P0,
-                  uint64_t maxp, uint64_t Emax, u128 Evrai, F emit) {
+                  uint64_t maxp, uint64_t Emax, u128 Evrai, F emit, N suivante) {
     int64_t dispo = v.fin - v.suiv;
     int pris = popc32(m);
     if ((int64_t)pris > dispo) pris = (int)dispo;
@@ -368,7 +408,7 @@ HD void voie_tour(Voie &v, unsigned m, int64_t tuile, const TU *U, const TU *Sg,
     }
     v.suiv += pris;
     if (!v.epuise && v.suiv >= v.fin) {                            // tuile finie : la suivante de ce warp
-        v.b += v.saut; v.tw_ok = 0;
+        v.b = suivante(v.b); v.tw_ok = 0;                          // meme valeur dans les 32 voies
         if (v.b < v.t1) { v.suiv = v.b; v.fin = v.b + tuile < v.t1 ? v.b + tuile : v.t1; }
         else { v.epuise = 1; v.suiv = v.fin = 0; }
     }
@@ -393,34 +433,76 @@ extern "C" void ag_emax_vrai(uint64_t hi, uint64_t lo) { hEvrai = ((u128)hi << 6
 
 #ifdef __CUDACC__
 
-#define TUILE ((int64_t)32 * 64)                 // couples par tuile de warp (64 par fil)
+#define TUILE ((int64_t)32 * 64)                 // pour le nombre de blocs lances (64 couples par fil)
+// Tuiles prises a la demande (compteur global) : les couples couteux (beaucoup de p) sont groupes dans
+// quelques regions ; avec de grandes tuiles fixes, tout le noyau attendait quelques warps (mesure ncu :
+// SM actifs 24 % du temps). Des petites tuiles distribuees dynamiquement equilibrent la charge.
+#define TUILE_DYN ((int64_t)128)
 
 static int64_t *dU, *dS, *dcs; static int32_t *djx, *dlo; static Sortie *dout; static int *dno;
 static int32_t *dU32, *dS32; static int h32 = 0;     // u et sigma(u) sur 32 bits quand ils y tiennent : trafic memoire / 2
-static unsigned long long *dnt, *dn2; static int dcap = 0;
+static unsigned long long *dnt, *dn2, *dctr; static int dcap = 0, nbmax = 0;
 
+#ifdef AG_CHRONO
+// diagnostic (nvcc -DAG_CHRONO) : par warp, duree totale, tuile la plus lente (debut t, duree), SM
+struct Chrono { long long tot, maxdt, tmax, ntu, u0, u2; int sm, ok; };
+#define NCHR 16384
+__device__ Chrono g_chr[NCHR];
+static int chr_fait = 0;
+#endif
 template <typename TU>
 __global__ void k_scan(int64_t t0, int64_t t1, const TU *U, const TU *Sg, const int32_t *jx,
                        const int32_t *lo, const int64_t *cs, int nw, int64_t G, int64_t S, uint64_t P0,
                        uint64_t maxp, uint64_t Emax, Sortie *out, int cap, int *no, unsigned long long *nt,
-                       unsigned long long *n2, uint64_t Evhi, uint64_t Evlo) {
+                       unsigned long long *n2, uint64_t Evhi, uint64_t Evlo, unsigned long long *ctr) {
     const u128 Evrai = ((u128)Evhi << 64) | Evlo;
     // Chaque warp traite des tuiles de TUILE couples consecutifs (voir struct Voie).
     const int voie = threadIdx.x & 31;
-    const int64_t warp = (blockIdx.x * (int64_t)blockDim.x + threadIdx.x) >> 5;
-    const int64_t nwarps = ((int64_t)gridDim.x * blockDim.x) >> 5;
+    // tuile suivante : la voie 0 la prend au compteur global, puis la diffuse aux 31 autres (appel uniforme
+    // dans le warp : suiv, fin et epuise sont identiques dans toutes les voies)
+#ifdef AG_CHRONO
+    long long c_deb = clock64(), c_tu = c_deb, c_max = -1, c_tmax = -1, c_tcur = -1, c_n = 0;
+#endif
+    auto suivante = [&](int64_t) -> int64_t {
+        unsigned long long k = 0;
+        if (voie == 0) k = atomicAdd(ctr, (unsigned long long)TUILE_DYN);
+        k = __shfl_sync(0xffffffffu, k, 0);
+#ifdef AG_CHRONO
+        long long now = clock64();
+        if (c_tcur >= 0 && now - c_tu > c_max) { c_max = now - c_tu; c_tmax = c_tcur; }
+        c_tu = now; c_tcur = (long long)(t0 + (int64_t)k); c_n++;
+#endif
+        return k < (unsigned long long)(t1 - t0) ? t0 + (int64_t)k : t1;
+    };
     Voie v;
-    voie_debut(v, voie, t0 + warp * TUILE, nwarps * TUILE, TUILE, t1);
+    voie_debut(v, voie, suivante(0), 0, TUILE_DYN, t1);
     auto emit = [&](uint64_t p) {
         int k = atomicAdd(no, 1);
         if (k < cap) { out[k].i = v.i; out[k].j = v.j; out[k].p = p; }
     };
     for (;;) {
         unsigned m = __ballot_sync(0xffffffffu, v.e.mode == 0);
-        voie_tour(v, m, TUILE, U, Sg, jx, lo, cs, nw, G, S, P0, maxp, Emax, Evrai, emit);
+        voie_tour(v, m, TUILE_DYN, U, Sg, jx, lo, cs, nw, G, S, P0, maxp, Emax, Evrai, emit, suivante);
         if (__ballot_sync(0xffffffffu, v.e.mode != 0) == 0 && v.epuise) break;
     }
     uint64_t loc = v.loc, loc2 = v.loc2;
+#ifdef AG_CHRONO
+    {
+        long long now = clock64();
+        if (c_tcur >= 0 && c_tcur < t1 && now - c_tu > c_max) { c_max = now - c_tu; c_tmax = c_tcur; }
+        int64_t gw = (blockIdx.x * (int64_t)blockDim.x + threadIdx.x) >> 5;
+        if (voie == 0 && gw < NCHR) {
+            Chrono c; c.tot = now - c_deb; c.maxdt = c_max; c.tmax = c_tmax; c.ntu = c_n; c.u0 = c.u2 = 0;
+            unsigned sm; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm)); c.sm = (int)sm; c.ok = 1;
+            if (c_tmax >= 0 && c_tmax < t1) {
+                int w = fenetre(cs, nw, c_tmax);
+                int64_t base = w ? cs[w - 1] : 0;
+                c.u0 = (long long)U[lo[w] + (int)(c_tmax - base)]; c.u2 = (long long)U[jx[w]];
+            }
+            g_chr[gw] = c;
+        }
+    }
+#endif
     atomicAdd(nt, (unsigned long long)loc);
     atomicAdd(n2, (unsigned long long)loc2);
 }
@@ -433,7 +515,7 @@ __global__ void k_scan(int64_t t0, int64_t t1, const TU *U, const TU *Sg, const 
 // de la carte n'est plus perdue
 static void liberer_tout(void) {
     void **pp[] = {(void **)&dU, (void **)&dS, (void **)&dU32, (void **)&dS32, (void **)&djx, (void **)&dlo,
-                   (void **)&dcs, (void **)&dout, (void **)&dno, (void **)&dnt, (void **)&dn2};
+                   (void **)&dcs, (void **)&dout, (void **)&dno, (void **)&dnt, (void **)&dn2, (void **)&dctr};
     for (unsigned k = 0; k < sizeof(pp) / sizeof(pp[0]); k++)
         if (*pp[k]) { cudaFree(*pp[k]); *pp[k] = NULL; }
 }
@@ -465,6 +547,13 @@ extern "C" int ag_charger(const int64_t *U, const int64_t *Sg, int nu, const int
     CK(cudaMalloc(&djx, (size_t)nw * 4)); CK(cudaMalloc(&dlo, (size_t)nw * 4)); CK(cudaMalloc(&dcs, (size_t)nw * 8));
     CK(cudaMalloc(&dout, (size_t)cap * sizeof(Sortie))); CK(cudaMalloc(&dno, sizeof(int)));
     CK(cudaMalloc(&dnt, sizeof(unsigned long long))); CK(cudaMalloc(&dn2, sizeof(unsigned long long)));
+    CK(cudaMalloc(&dctr, sizeof(unsigned long long)));
+    if (!nbmax) {                                  // grille persistante : juste de quoi remplir la carte
+        int dev = 0, nsm = 0, occ = 0;
+        CK(cudaGetDevice(&dev)); CK(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev));
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_scan<int32_t>, 256, 0));
+        nbmax = nsm * (occ > 0 ? occ : 1);
+    }
     CK(cudaMemcpy(djx, jx, (size_t)nw * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dlo, lo, (size_t)nw * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dcs, cs, (size_t)nw * 8, cudaMemcpyHostToDevice));
@@ -475,18 +564,42 @@ extern "C" int ag_charger(const int64_t *U, const int64_t *Sg, int nu, const int
 extern "C" int ag_scan(int64_t t0, int64_t t1, int32_t *oi, int32_t *oj, uint64_t *op, unsigned long long *ntest,
                        unsigned long long *nth2) {
     CK(cudaMemset(dno, 0, sizeof(int))); CK(cudaMemset(dnt, 0, sizeof(unsigned long long)));
-    CK(cudaMemset(dn2, 0, sizeof(unsigned long long)));
+    CK(cudaMemset(dn2, 0, sizeof(unsigned long long))); CK(cudaMemset(dctr, 0, sizeof(unsigned long long)));
     int64_t m = t1 - t0;
     // blocs de 256 fils = 8 warps = 8 tuiles par tour de grille
     int64_t nb64 = (m + 8 * TUILE - 1) / (8 * TUILE);
-    int nb = nb64 > 65536 ? 65536 : (nb64 < 1 ? 1 : (int)nb64);
+    int nb = nb64 > nbmax ? nbmax : (nb64 < 1 ? 1 : (int)nb64);
     if (h32)
         k_scan<<<nb, 256>>>(t0, t1, (const int32_t *)dU32, (const int32_t *)dS32, djx, dlo, dcs, hnw, hG, hS, hP0, hmaxp,
-                             hEmax, dout, dcap, dno, dnt, dn2, (uint64_t)(hEvrai >> 64), (uint64_t)hEvrai);
+                             hEmax, dout, dcap, dno, dnt, dn2, (uint64_t)(hEvrai >> 64), (uint64_t)hEvrai, dctr);
     else
         k_scan<<<nb, 256>>>(t0, t1, (const int64_t *)dU, (const int64_t *)dS, djx, dlo, dcs, hnw, hG, hS, hP0, hmaxp,
-                             hEmax, dout, dcap, dno, dnt, dn2, (uint64_t)(hEvrai >> 64), (uint64_t)hEvrai);
+                             hEmax, dout, dcap, dno, dnt, dn2, (uint64_t)(hEvrai >> 64), (uint64_t)hEvrai, dctr);
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+#ifdef AG_CHRONO
+    if (!chr_fait) {                               // premier appel seulement : resume sur stderr
+        chr_fait = 1;
+        int nwp = nb * 8 < NCHR ? nb * 8 : NCHR;
+        Chrono *c = (Chrono *)calloc(nwp, sizeof(Chrono));
+        CK(cudaMemcpyFromSymbol(c, g_chr, (size_t)nwp * sizeof(Chrono)));
+        double s = 0; long long mn = -1, mx = 0; int imx = 0;
+        for (int k = 0; k < nwp; k++) {
+            s += c[k].tot; if (mn < 0 || c[k].tot < mn) mn = c[k].tot;
+            if (c[k].tot > mx) { mx = c[k].tot; imx = k; }
+        }
+        fprintf(stderr, "[chrono] t0=%lld t1=%lld : %d warps, duree (Mcycles) min %.2f moy %.2f max %.2f (warp %d, SM %d, %lld tuiles)\n",
+                (long long)t0, (long long)t1, nwp, mn / 1e6, s / nwp / 1e6, mx / 1e6, imx, c[imx].sm, c[imx].ntu);
+        for (int r = 0; r < 8; r++) {                // 8 tuiles les plus lentes
+            int b = -1;
+            for (int k = 0; k < nwp; k++) if (c[k].ok && (b < 0 || c[k].maxdt > c[b].maxdt)) b = k;
+            if (b < 0) break;
+            fprintf(stderr, "[chrono] tuile t=%lld : %.2f Mcycles (warp %d, SM %d, warp total %.2f) u0=%lld u2=%lld\n",
+                    c[b].tmax, c[b].maxdt / 1e6, b, c[b].sm, c[b].tot / 1e6, c[b].u0, c[b].u2);
+            c[b].ok = 0;
+        }
+        free(c);
+    }
+#endif
     int no; unsigned long long nt;
     CK(cudaMemcpy(&no, dno, sizeof(int), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(&nt, dnt, sizeof(nt), cudaMemcpyDeviceToHost));
@@ -521,15 +634,25 @@ extern "C" int ag_scan(int64_t t0, int64_t t1, int32_t *oi, int32_t *oj, uint64_
     unsigned long long nt = 0, n2 = 0;
 #ifdef AG_SIMU
     // controle de la logique des warps du GPU : 32 voies simulees par « warp », memes fonctions
-    const int64_t TU = 2048, NWARP = 64;
+    // tuiles de 128 couples prises a un compteur commun, comme le noyau GPU
+    const int64_t TU = 128, NWARP = 64;
+    int64_t ctr = 0;
+    auto suivante = [&](int64_t) -> int64_t {
+        int64_t k;
+        #pragma omp atomic capture
+        { k = ctr; ctr += TU; }
+        return k < t1 - t0 ? t0 + k : t1;
+    };
     #pragma omp parallel for schedule(dynamic, 1) reduction(+:nt, n2)
     for (int64_t wp = 0; wp < NWARP; wp++) {
         Voie V[32];
-        for (int l = 0; l < 32; l++) voie_debut(V[l], l, t0 + wp * TU, NWARP * TU, TU, t1);
+        int64_t b0 = suivante(0);                  // une seule prise pour les 32 voies (diffusee sur GPU)
+        for (int l = 0; l < 32; l++) voie_debut(V[l], l, b0, 0, TU, t1);
         for (;;) {
             unsigned m = 0;
             for (int l = 0; l < 32; l++) m |= (unsigned)(V[l].e.mode == 0) << l;
             unsigned actifs = 0;
+            int64_t prise = 0; int pris_ok = 0;    // tuile prise par la premiere voie qui la demande ce tour
             for (int l = 0; l < 32; l++) {
                 Voie &v = V[l];
                 voie_tour(v, m, TU, cU, cS, cjx, clo, ccs, hnw, hG, hS, hP0, hmaxp, hEmax, hEvrai,
@@ -538,7 +661,7 @@ extern "C" int ag_scan(int64_t t0, int64_t t1, int32_t *oi, int32_t *oj, uint64_
                     #pragma omp atomic capture
                     k = no++;
                     if (k < ccap) { oi[k] = v.i; oj[k] = v.j; op[k] = p; }
-                });
+                }, [&](int64_t) { if (!pris_ok) { prise = suivante(0); pris_ok = 1; } return prise; });
                 actifs |= (unsigned)(v.e.mode != 0) << l;
             }
             if (!actifs && V[0].epuise) break;
