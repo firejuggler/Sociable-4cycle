@@ -278,9 +278,16 @@ def section3():
             c, st = run(base + ["--u", U] + opt, env={"AG_TEST_CAP": cap})
             verifie(c == ref and st.get("emax_hybride"), f"hybride cap={cap} {nom} : {len(c)} cycles / {len(ref)}")
     # partition : --u-deja redonne exactement le run complet
-    a = run(base + ["--u", "5e4", "--gpu", "cpu"])[0]
-    b = run(base + ["--u", "1e5", "--u-deja", "5e4", "--gpu", "cpu"])[0]
+    # (et les compteurs s'ajoutent exactement : chaque couple est vu une fois et une seule)
+    a, sa = run(base + ["--u", "5e4", "--gpu", "cpu"])
+    b, sb = run(base + ["--u", "1e5", "--u-deja", "5e4", "--gpu", "cpu"])
+    _, sp = run(base + ["--u", "1e5", "--gpu", "cpu"])
     verifie(a | b == ref, f"--u-deja : {len(a)} + {len(b)} cycles, union {len(a | b)} / complet {len(ref)}")
+    for k in ("couples", "p_testes", "th2", "premiers"):
+        verifie(sa.get(k, 0) + sb.get(k, 0) == sp.get(k), f"--u-deja : {k} {sa.get(k)} + {sb.get(k)} != {sp.get(k)}")
+    for cap in ("1000",):                              # --u-deja en mode hybride, chemin des warps du GPU
+        b2, sb2 = run(base + ["--u", "1e5", "--u-deja", "5e4", "--gpu", simu], env={"AG_TEST_CAP": cap})
+        verifie(b2 == b and sb2.get("premiers") == sb.get("premiers"), f"--u-deja hybride : {len(b2)} cycles / {len(b)}")
     print(f"  3. chemins entiers, hybride, --u-deja : {time.time() - t0:.0f} s", flush=True)
 
 
