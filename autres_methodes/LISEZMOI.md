@@ -82,13 +82,18 @@ Elle fait la même recherche que `search_asym.py`, avec trois différences :
 - **Le noyau.** L'appariement est en C++/CUDA (`asym_gpu.cu`). La même source tourne sur la carte ou sur le CPU
   avec OpenMP, comme `apparie_gpu.cu`.
 - **Un pré-filtre local dans le noyau.** Il vérifie que la chaîne est possible modulo 3^K, 5^K, 7^K et 2^K
-  (avec K ≤ `--filtre`). Il ne rejette jamais un vrai cycle : testé sur les 109 cycles du catalogue de cette
+  (avec l^K ≤ `--filtre`). Pour p fixé, la chaîne est affine en q, donc on teste tous les q d'un coup : le coût
+  est en O(M) au lieu de O(M²). La version exhaustive reste dans le source (`-DASYM_TEST_BRUTE`) pour comparer. Il ne rejette jamais un vrai cycle : testé sur les 109 cycles du catalogue de cette
   forme, aucun rejet. Il retire environ 95 % des candidats avant le crible Python. Le crible complet (`rho`) et
   la factorisation PARI s'appliquent ensuite aux survivants, répartis sur `--jobs` processus.
 - **Un seuil de C fixe** (`--cmax`, 2e5 par défaut). La couverture est donc complète jusqu'à `cmax` sur toute la
   plage. Le programme découpe la plage du grand u en tranches : si une tranche donne plus de `--cap`
   candidats, il la coupe en deux et la refait ; si elle en donne peu, la tranche suivante est deux fois plus
   grande.
+
+- **La carte et le processeur travaillent en même temps.** Pendant que le CPU traite une tranche (crible complet
+  et PARI), la carte calcule la suivante. Chaque ligne affiche `[GPU x s | CPU y s]` : si y est bien plus grand
+  que x, la carte attend le CPU, et il vaut mieux baisser `--cmax` ou augmenter `--jobs`.
 
 La reprise passe par `<out>.faits`, et Ctrl-C est sans danger. Pour compiler :
 

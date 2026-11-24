@@ -148,6 +148,34 @@ def main():
     out = np.zeros((CAP, 5), np.int64); stats = np.zeros(3, np.int64)
     pool = Pool(a.jobs, initializer=_init_post, initargs=(G, sG, UU, SS, a.pari_sec))
     total = dict(quads=0, filtered=0, cand=0, zero=0, factored=0, found=0, hard=0)
+    attente = None
+
+    def finir(t):
+        """Attend le traitement CPU d'une tranche, ecrit ses resultats et la marque comme faite."""
+        if t is None:
+            return
+        res = t["res"].get() if t["res"] is not None else []
+        nz = sum(r[0] for r in res); nf = sum(r[1] for r in res)
+        cyc = [c for r in res for c in r[2]]; durs = [d for r in res for d in r[3]]
+        vus = set()
+        for c in cyc:
+            if min(c["cycle"]) in vus:
+                continue
+            vus.add(min(c["cycle"])); P(c)
+            print("CYCLE", c, flush=True)
+        for d in durs:
+            P(dict(hard=True, **d))
+        tp = time.time() - t["t0"]
+        P(dict(tranche=True, pos=t["pos"], u_lo=t["u_lo"], u_hi=t["u_hi"], quads=t["quads"], toobig=t["toobig"],
+               filtered=t["filtered"], cand=t["cand"], zero=int(nz), factored=int(nf), found=len(vus), hard=len(durs),
+               t_app=t["t_app"], t_post=round(tp, 1)))
+        print(f"pos {t['pos']}  u {t['u_lo']}..{t['u_hi']}  quads {t['quads']:.3g}  filtres {t['filtered']}"
+              f"  cand {t['cand']}  facto {nf}  cycles {len(vus)}  [GPU {t['t_app']:.1f}s | CPU {tp:.1f}s]", flush=True)
+        fdone.write(json.dumps(dict(cle=t["cle"], u_lo=t["u_lo"], u_hi=t["u_hi"])) + "\n"); fdone.flush()
+        for kk, v in (("quads", t["quads"]), ("filtered", t["filtered"]), ("cand", t["cand"]), ("zero", nz),
+                      ("factored", nf), ("found", len(vus)), ("hard", len(durs))):
+            total[kk] += v
+
     try:
         for pos in a.pos:
             u1max = UHI if pos == 1 else US
@@ -176,32 +204,16 @@ def main():
                     continue
                 tm = time.time() - ta
                 rows = out[:k].copy()
-                tb = time.time()
+                # le CPU traite cette tranche pendant que la carte calcule la suivante
+                finir(attente)
                 lots = [rows[i::a.jobs] for i in range(a.jobs)] if k else []
-                res = pool.map(_traiter, lots) if k else []
-                nz = sum(r[0] for r in res); nf = sum(r[1] for r in res)
-                cyc = [c for r in res for c in r[2]]; durs = [d for r in res for d in r[3]]
-                vus = set()
-                for c in cyc:
-                    if min(c["cycle"]) in vus:
-                        continue
-                    vus.add(min(c["cycle"])); P(c)
-                    print("CYCLE", c, flush=True)
-                for d in durs:
-                    P(dict(hard=True, **d))
-                uhi_t = int(UU[NS + e - 1])
-                P(dict(tranche=True, pos=pos, u_lo=ulo_t, u_hi=uhi_t, quads=int(stats[0]), toobig=int(stats[1]), filtered=int(stats[2]),
-                       cand=int(k), zero=int(nz), factored=int(nf), found=len(vus), hard=len(durs),
-                       t_app=round(tm, 2), t_post=round(time.time() - tb, 1)))
-                print(f"pos {pos}  u {ulo_t}..{uhi_t}  quads {stats[0]:.3g}  filtres {stats[2]}  cand {k}  facto {nf}  cycles {len(vus)}"
-                      f"  [{tm:.1f}s + {time.time() - tb:.1f}s]", flush=True)
-                fdone.write(json.dumps(dict(cle=cle, u_lo=ulo_t, u_hi=uhi_t)) + "\n"); fdone.flush()
-                for kk, v in (("quads", int(stats[0])), ("filtered", int(stats[2])), ("cand", int(k)), ("zero", nz), ("factored", nf),
-                              ("found", len(vus)), ("hard", len(durs))):
-                    total[kk] += v
+                attente = dict(res=pool.map_async(_traiter, lots) if k else None, pos=pos, cle=cle,
+                               u_lo=ulo_t, u_hi=int(UU[NS + e - 1]), quads=int(stats[0]), toobig=int(stats[1]),
+                               filtered=int(stats[2]), cand=int(k), t_app=round(tm, 2), t0=time.time())
                 b = e
                 if k < CAP // 8:                 # peu de candidats : tranche suivante plus grande
                     taille = min(NB, taille * 2)
+        finir(attente); attente = None
     except KeyboardInterrupt:
         print("interrompu : les tranches terminees sont dans", faits_path, flush=True)
     finally:

@@ -72,11 +72,12 @@ HD static inline i64 invmod(i64 a, i64 m) {      // a inversible modulo m
     return mmod(t, m);
 }
 
+#ifdef ASYM_TEST_BRUTE   // version exhaustive O(M^2), gardee pour verifier local_ok (g++ -DASYM_TEST_BRUTE)
 // Pre-filtre local (meme logique que rho() de resid.py, mais sans C, D, E) : existe-t-il des residus unites
 // p, q modulo M = l^K tels que la chaine n1 = G u1 p q -> G u2 P2 -> G u3 P3 -> G u4 P4 -> n1 soit possible
 // modulo les puissances de l ? Si non, le quadruplet n'a aucune solution. Perte de precision = accepte.
 // Plus permissif que rho() (q n'est pas impose par l'equation bilineaire) : il ne rejette jamais un vrai cycle.
-HD static inline bool local_ok(i64 l, const i64 *u, const i64 *su, i64 G, i64 SG, i64 fmax) {
+HD static inline bool local_ok_brute(i64 l, const i64 *u, const i64 *su, i64 G, i64 SG, i64 fmax) {
     i64 pw[4], us[4]; int v = 0;
     for (int i = 0; i < 4; i++) {
         i64 x = G * u[i]; pw[i] = 1;
@@ -106,6 +107,90 @@ HD static inline bool local_ok(i64 l, const i64 *u, const i64 *su, i64 G, i64 SG
             }
             if (unk) return true;
             if (ok && mmod(n - n1, Mc) == 0) return true;
+        }
+    }
+    return false;
+}
+
+#endif
+
+// Pre-filtre local (meme logique que rho() de resid.py, mais sans C, D, E) : existe-t-il des residus unites
+// p, q modulo M = l^K tels que la chaine soit possible modulo les puissances de l ? Si non, aucun cycle.
+// Plus permissif que rho() : il ne rejette jamais un vrai cycle. Calcul en O(M) au lieu de O(M^2) : pour p fixe, tout est affine en q. On ecrit
+// q = Q0 + Qm*t (t entier libre) et chaque quantite comme a*t + b modulo Mc. Une divisibilite par pw restreint t
+// a une classe (t = t0 + s*t'), ce qui garde les formes affines. A la fin, la fermeture n4' = n1 est une
+// congruence lineaire en t ; il reste a verifier que q et les quotients x_i peuvent etre des unites mod l.
+struct Aff { i64 a, b; };                                  // a*t + b
+
+HD static inline bool local_ok(i64 l, const i64 *u, const i64 *su, i64 G, i64 SG, i64 fmax) {
+    i64 pw[4], us[4]; int v = 0;
+    for (int i = 0; i < 4; i++) {
+        i64 x = G * u[i]; pw[i] = 1;
+        while (x % l == 0) { x /= l; pw[i] *= l; v++; }
+        us[i] = x;
+    }
+    int K = v + 1 > 2 ? v + 1 : 2;
+    i64 M = 1;
+    for (int k = 0; k < K; k++) { M *= l; if (M > fmax) return true; }
+    i64 A1 = mmod(G * u[0], M), B1 = mmod(SG * su[0], M);
+    i64 cs[4], cg[4];                                       // SG*sigma(u_i), G*u_i
+    for (int i = 0; i < 4; i++) { cs[i] = SG * su[i]; cg[i] = G * u[i]; }
+    for (i64 p = 1; p < M; p++) {
+        if (p % l == 0) continue;
+        // formes en t, modulo M au depart ; q = t
+        Aff q = {1, 0};
+        Aff cons[4]; int nc = 0;                            // formes qui doivent etre des unites mod l
+        // n1 = A1 p q ; n2 = B1 (p+1)(q+1) - n1
+        i64 c1 = A1 * p % M;
+        Aff n = {mmod(B1 * ((p + 1) % M) % M - c1, M), B1 * ((p + 1) % M) % M};
+        i64 Mc = M; bool ok = true, unk = false;
+        for (int i = 1; i < 4 && ok; i++) {
+            if (Mc <= pw[i]) { unk = true; break; }
+            if (pw[i] > 1) {                                // a t + b = 0 (mod pw)  ->  t = t0 + s t'
+                i64 a = mmod(n.a, pw[i]), b = mmod(n.b, pw[i]);
+                i64 g = 1;
+                while (g < pw[i] && a % (g * l) == 0) g *= l;   // g = pgcd(a, pw) (puissance de l)
+                if (a == 0) g = pw[i];
+                if (b % g) { ok = false; break; }
+                i64 s = pw[i] / g;
+                i64 t0 = (s == 1) ? 0 : mmod((-b / g) % s * invmod((a / g) % s, s), s);
+                // substitution t = t0 + s t' dans toutes les formes
+                n = {mmod(n.a * s, Mc), mmod(n.a * t0 + n.b, Mc)};
+                q = {mmod(q.a * s, M), mmod(q.a * t0 + q.b, M)};
+                for (int k = 0; k < nc; k++) cons[k] = {mmod(cons[k].a * s, l), mmod(cons[k].a * t0 + cons[k].b, l)};
+            }
+            i64 Mc2 = Mc / pw[i];
+            Aff x = {mmod(n.a / pw[i], Mc2), mmod(n.b / pw[i], Mc2)};   // exact : pw divise a et b
+            cons[nc++] = {x.a % l, x.b % l};
+            i64 iv = invmod(us[i] % Mc2, Mc2);
+            Aff P = {x.a * iv % Mc2, x.b * iv % Mc2};
+            Mc = Mc2;
+            i64 e1 = mmod(cs[i], Mc), e2 = mmod(cg[i], Mc);
+            // n = SG s_i (P+1) - G u_i P
+            n = {mmod(e1 * P.a % Mc - e2 * P.a % Mc, Mc), mmod(e1 * ((P.b + 1) % Mc) % Mc - e2 * P.b % Mc, Mc)};
+        }
+        if (unk) return true;
+        if (!ok) continue;
+        // fermeture : n = A1 p q (mod Mc)
+        Aff n1 = {mmod(c1 * q.a, Mc), mmod(c1 * q.b, Mc)};
+        i64 ca = mmod(n.a - n1.a, Mc), cb = mmod(n1.b - n.b, Mc);  // ca t = cb (mod Mc)
+        i64 g = 1;
+        while (g < Mc && ca % (g * l) == 0) g *= l;
+        if (ca == 0) g = Mc;
+        if (cb % g) continue;
+        i64 s = Mc / g;
+        cons[nc++] = {q.a % l, q.b % l};
+        if (s == 1) {                                       // t libre : existe-t-il t mod l convenable ?
+            for (i64 t = 0; t < l; t++) {
+                bool bon = true;
+                for (int k = 0; k < nc && bon; k++) if ((cons[k].a * t + cons[k].b) % l == 0) bon = false;
+                if (bon) return true;
+            }
+        } else {                                            // t = t1 (mod s), s >= l : t mod l fixe
+            i64 t1 = mmod((cb / g) % s * invmod((ca / g) % s, s), s) % l;
+            bool bon = true;
+            for (int k = 0; k < nc && bon; k++) if ((cons[k].a * t1 + cons[k].b) % l == 0) bon = false;
+            if (bon) return true;
         }
     }
     return false;
