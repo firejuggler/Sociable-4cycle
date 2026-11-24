@@ -91,6 +91,10 @@ Elle fait la même recherche que `search_asym.py`, avec trois différences :
   candidats, il la coupe en deux et la refait ; si elle en donne peu, la tranche suivante est deux fois plus
   grande.
 
+- **Deux noyaux sur la carte.** Le premier fait l'appariement et garde les quadruplets avec C ≤ cmax ; le
+  second applique le pré-filtre avec un warp par candidat (les 32 fils se partagent les valeurs de p), pour
+  qu'aucun fil n'attende les autres. Le tampon entre les deux contient `ASYM_CAP1` candidats (3e7 par défaut,
+  soit 720 Mo sur la carte) ; s'il déborde, la tranche est coupée en deux.
 - **La carte et le processeur travaillent en même temps.** Pendant que le CPU traite une tranche (crible complet
   et PARI), la carte calcule la suivante. Chaque ligne affiche `[GPU x s | CPU y s]` : si y est bien plus grand
   que x, la carte attend le CPU, et il vaut mieux baisser `--cmax` ou augmenter `--jobs`.
@@ -124,6 +128,22 @@ Options :
 
 Le noyau utilise 118 registres par fil (mesuré avec `-Xptxas -v`). Comme pour `apparie_gpu.cu`, ajouter
 `-maxrregcount=64` peut accélérer : à mesurer sur la carte.
+
+### Vérifier et mesurer le noyau (`bench_asym.py`)
+
+Il calcule la même tranche avec chaque bibliothèque et vérifie que les candidats (i1, i2, i3, i4, C) et les
+compteurs sont **identiques**. Il mesure aussi le temps et le débit (quadruplets par seconde) pour chaque valeur
+de `--filtre`, après un appel de chauffe. `--filtre 0` donne le temps de l'appariement seul.
+
+    python3 bench_asym.py 4 3000001 3020000 --libs libasym_cpu.so libasym_gpu.so --filtre 0 128 2000
+
+Pour comparer deux compilations du noyau GPU, par exemple avec `-maxrregcount=64` :
+
+    nvcc -O3 -arch=sm_120 -maxrregcount=64 -Xcompiler -fPIC -shared -o libasym_gpu64.so asym_gpu.cu
+    python3 bench_asym.py 4 3000001 3020000 --libs libasym_gpu.so libasym_gpu64.so --filtre 2000
+
+Pour voir où part le temps sur la carte : `nsys profile python3 bench_asym.py ...`, qui donne la chronologie
+des deux noyaux et des copies, puis `ncu`, qui analyse un noyau.
 
 ## Variante 3 : cycle mère → filles (`breed4.py`)
 
