@@ -64,7 +64,7 @@ rows=out[:cnt]; rows=rows[np.argsort(rows[:,4])]
 # ---- local density scoring
 pfc={}
 def pfs(x):
-    if x not in pfc: pfc[x]=primefactors(x)
+    if x not in pfc: pfc[x]=[int(l) for l in primefactors(x)]
     return pfc[x]
 def vv(x,l):
     v=0
@@ -83,7 +83,7 @@ def score(s,u,C,D,E,maxM=8192):
         if l**K>maxM:
             r*=float(l)**(-sum(vv(x,l) for x in u[1:])); continue
         M=l**K
-        a,b=rho(l,K,C%M,D%M,E%M,sG,G,sa,ua)
+        a,b=rho(int(l),int(K),int(C%M),int(D%M),int(E%M),int(sG),int(G),sa,ua)
         if a==0: return 0.0
         r*=a/b
     return r
