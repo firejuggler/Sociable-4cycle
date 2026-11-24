@@ -386,7 +386,7 @@ extern "C" i64 asym_run(int pos, i64 t0, i64 t1, double lo_eps, i64 cmax, double
     cudaMemcpy(c, d_cnt, sizeof(c), cudaMemcpyDeviceToHost);
     stats[0] = (i64)c[1]; stats[1] = (i64)c[2]; stats[2] = 0;
     i64 n1 = (i64)c[0];
-    if (n1 > cap1) return cap + 1;                    // tampon de phase 1 plein : l'appelant coupe la tranche
+    if (n1 > cap1) { stats[2] = -1; return cap + 1; } // tampon de phase 1 plein (signale par stats[2] = -1)
     u64 zero = 0;
     cudaMemcpy(&d_cnt[0], &zero, sizeof(u64), cudaMemcpyHostToDevice);
     if (n1 > 0) {

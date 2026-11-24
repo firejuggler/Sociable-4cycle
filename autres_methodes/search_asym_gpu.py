@@ -184,7 +184,7 @@ def main():
             LYmax = math.log(2.0 ** 63) + math.log(1.0 / EPS) - 1.0
             cle = f"G={G} us={US} cmax={CMAX} nmin={a.nmin:g} eps={EPS:.6g} pos={pos}"
             couverts = faits.get(cle, [])
-            b = 0; taille = max(1, a.tranche)
+            b = 0; taille = max(1, a.tranche); plafond = NB   # plafond : plus grande taille qui n'a pas deborde
             while b < NB:
                 ulo_t = int(UU[NS + b])
                 # tranche deja faite ? (intervalles de u)
@@ -200,8 +200,10 @@ def main():
                 if k > CAP:                      # trop de candidats : on coupe la tranche en deux
                     if e - b == 1:
                         sys.exit(f"un seul grand u donne {k} candidats > cap : augmenter --cap ou baisser --cmax")
-                    taille = max(1, (e - b) // 2)
-                    print(f"  tranche trop pleine ({k} > cap) : taille -> {taille}", flush=True)
+                    taille = max(1, (e - b) // 2); plafond = taille
+                    quoi = ("tampon entre les deux noyaux GPU (ASYM_CAP1)" if stats[2] == -1
+                            else f"{k} candidats > --cap")
+                    print(f"  tranche trop pleine ({quoi}) : taille -> {taille}", flush=True)
                     continue
                 tm = time.time() - ta
                 rows = out[:k].copy()
@@ -213,7 +215,7 @@ def main():
                                filtered=int(stats[2]), cand=int(k), t_app=round(tm, 2), t0=time.time())
                 b = e
                 if k < CAP // 8:                 # peu de candidats : tranche suivante plus grande
-                    taille = min(NB, taille * 2)
+                    taille = min(NB, taille * 2, plafond)
         finir(attente); attente = None
     except KeyboardInterrupt:
         print("interrompu : les tranches terminees sont dans", faits_path, flush=True)
