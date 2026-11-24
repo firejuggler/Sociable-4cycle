@@ -8,7 +8,11 @@ import tempfile
 from collections import Counter
 from math import prod
 
-YAFU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yafu", "yafu")
+_ICI = os.path.dirname(os.path.abspath(__file__))
+# binaire : variable d'environnement YAFU, sinon yafu-linux-avx512ifma dans ce dossier, sinon yafu/yafu
+YAFU = os.environ.get("YAFU") or next(
+    (c for c in (os.path.join(_ICI, "yafu-linux-avx512ifma"), os.path.join(_ICI, "yafu", "yafu")) if os.path.exists(c)),
+    os.path.join(_ICI, "yafu-linux-avx512ifma"))
 
 
 def yafu_factor(N, timeout=600, threads=1):

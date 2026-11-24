@@ -42,8 +42,9 @@ qui lit `icoef.txt`). Les survivants sont factorisés avec PARI, puis avec yafu.
 Ce que search3.py demande :
 
 - les paquets numpy, numba, sympy, cypari2 et cysignals ;
-- `yafu_factor.py` (enveloppe Python de yafu), pour les nombres que PARI ne casse pas ; la ligne `YAFU = ...`
-  donne le chemin du binaire ;
+- `yafu_factor.py` (enveloppe Python de yafu), pour les nombres que PARI ne casse pas. Il cherche le binaire
+  `yafu-linux-avx512ifma` dans le même dossier ; on peut aussi donner un autre chemin avec la variable
+  d'environnement `YAFU` ;
 - `NMIN` : taille minimale du cycle visé. La valeur 1e14 ignore la zone où le catalogue est déjà complet.
 
 ### Test de validation : le cycle n° 123 (1,8·10^19)
@@ -59,7 +60,20 @@ Cette commande retrouve le cycle 18232712294944907104 → … en quelques second
 petits (au plus 544) et un seul est grand (environ 3,4·10^6). Les recherches lancées ici ne pouvaient pas
 l'atteindre, parce qu'elles bornaient tous les u par la même limite (U ≤ 5000).
 
-Piste suggérée : une recherche asymétrique, avec trois u petits et un u très grand.
+### Recherche asymétrique (`search_asym.py`)
+
+Elle prend trois cofacteurs petits (u ≤ Us) et un grand (u dans [Ulo, Uhi]), placé en position `pos`
+(1 à 4, et u1 porte p·q). La moitié A, (petit, grand), est parcourue à la volée ; la moitié B, (petit, petit),
+est triée. Le crible et la factorisation sont les mêmes que dans search3.py.
+
+    python3 search_asym.py G Us Ulo Uhi pos cap worker nworkers log NMIN tbudget [pari_sec] [eps]
+
+Test de validation : sans connaître les u, elle retrouve le n° 123 en environ 4 min sur un cœur.
+
+    python3 search_asym.py 1 600 3354000 3355000 2 4000000 0 1 t123.log 1e14 300
+
+Le coût est d'environ 2·10^4 quadruplets par valeur du grand u (avec Us = 600). La phase de crible est la plus
+longue : augmenter `tbudget` quand la plage [Ulo, Uhi] est large.
 
 ## Variante 3 : cycle mère → filles (`breed4.py`)
 
