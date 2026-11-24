@@ -75,6 +75,51 @@ Test de validation : sans connaître les u, elle retrouve le n° 123 en environ 
 Le coût est d'environ 2·10^4 quadruplets par valeur du grand u (avec Us = 600). La phase de crible est la plus
 longue : augmenter `tbudget` quand la plage [Ulo, Uhi] est large.
 
+### Version GPU avec découpage automatique (`search_asym_gpu.py`, `asym_gpu.cu`)
+
+Elle fait la même recherche que `search_asym.py`, avec trois différences :
+
+- **Le noyau.** L'appariement est en C++/CUDA (`asym_gpu.cu`). La même source tourne sur la carte ou sur le CPU
+  avec OpenMP, comme `apparie_gpu.cu`.
+- **Un pré-filtre local dans le noyau.** Il vérifie que la chaîne est possible modulo 3^K, 5^K, 7^K et 2^K
+  (avec K ≤ `--filtre`). Il ne rejette jamais un vrai cycle : testé sur les 109 cycles du catalogue de cette
+  forme, aucun rejet. Il retire environ 95 % des candidats avant le crible Python. Le crible complet (`rho`) et
+  la factorisation PARI s'appliquent ensuite aux survivants, répartis sur `--jobs` processus.
+- **Un seuil de C fixe** (`--cmax`, 2e5 par défaut). La couverture est donc complète jusqu'à `cmax` sur toute la
+  plage. Le programme découpe la plage du grand u en tranches : si une tranche donne plus de `--cap`
+  candidats, il la coupe en deux et la refait ; si elle en donne peu, la tranche suivante est deux fois plus
+  grande.
+
+La reprise passe par `<out>.faits`, et Ctrl-C est sans danger. Pour compiler :
+
+    nvcc -O3 -arch=sm_120 -Xcompiler -fPIC -shared -o libasym_gpu.so asym_gpu.cu
+    # (version CPU : compilée automatiquement depuis asym_gpu.cu si l'on ne donne pas --gpu)
+
+Test (cycle n° 123) :
+
+    python3 search_asym_gpu.py 1 3354000 3355000 --pos 2 --out t123.log --gpu
+
+Recherche :
+
+    python3 search_asym_gpu.py 4 2000000 10000000 --pos 2 3 4 --gpu --jobs 8 --out g4_asym.log
+
+Options :
+
+| Option | Défaut | Rôle |
+|---|---:|---|
+| `--us` | 600 | borne des trois petits u |
+| `--pos` | 2 | position(s) du grand u, de 1 à 4 |
+| `--cmax` | 2e5 | seuil fixe du C réduit |
+| `--cap` | 4e6 | candidats maximum par tranche (au-delà, la tranche est coupée) |
+| `--tranche` | 20000 | taille de la première tranche, en nombre de grands u |
+| `--filtre` | 128 | modules l^K du pré-filtre ; 0 le désactive |
+| `--jobs` | nombre de cœurs | processus pour le crible et PARI |
+| `--pari-sec` | 2 | temps maximal de PARI par N ; au-delà, N est noté `"hard": true` (pour yafu) |
+| `--refaire` | — | ignorer `<out>.faits` |
+
+Le noyau utilise 118 registres par fil (mesuré avec `-Xptxas -v`). Comme pour `apparie_gpu.cu`, ajouter
+`-maxrregcount=64` peut accélérer : à mesurer sur la carte.
+
 ## Variante 3 : cycle mère → filles (`breed4.py`)
 
 C'est une adaptation aux cycles de la règle de te Riele. Elle retrouve 63 cycles mères, mais ne produit

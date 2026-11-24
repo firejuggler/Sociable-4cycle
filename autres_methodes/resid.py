@@ -3,7 +3,8 @@ import numba as nb, numpy as np
 from math import gcd
 from sympy import primefactors
 from sympy import symbols
-Estr=open('icoef.txt').read().split('E=')[1].strip()
+import os
+Estr=open(os.path.join(os.path.dirname(os.path.abspath(__file__)),'icoef.txt')).read().split('E=')[1].strip()
 _S,_g,_s1,_s2,_s3,_s4,_u1,_u2,_u3,_u4=symbols('S g s1 s2 s3 s4 u1 u2 u3 u4')
 Efun=eval('lambda S,g,s1,s2,s3,s4,u1,u2,u3,u4: '+Estr)
 def icoeffs(S,g,s,u):
