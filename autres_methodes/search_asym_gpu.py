@@ -165,10 +165,11 @@ def main():
             print("CYCLE", c, flush=True)
         for d in durs:
             P(dict(hard=True, **d))
-        tp = time.time() - t["t0"]
+        tp = max((r[4] for r in res), default=0.0)          # vrai temps CPU (processus le plus lent)
+        tw = time.time() - t["t0"]                            # depuis la soumission (inclut le recouvrement)
         P(dict(tranche=True, pos=t["pos"], u_lo=t["u_lo"], u_hi=t["u_hi"], quads=t["quads"], toobig=t["toobig"],
                filtered=t["filtered"], cand=t["cand"], zero=int(nz), factored=int(nf), found=len(vus), hard=len(durs),
-               t_app=t["t_app"], t_post=round(tp, 1)))
+               t_app=t["t_app"], t_post=round(tp, 1), t_mur=round(tw, 1)))
         print(f"pos {t['pos']}  u {t['u_lo']}..{t['u_hi']}  quads {t['quads']:.3g}  filtres {t['filtered']}"
               f"  cand {t['cand']}  facto {nf}  cycles {len(vus)}  [GPU {t['t_app']:.1f}s | CPU {tp:.1f}s]", flush=True)
         fdone.write(json.dumps(dict(cle=t["cle"], u_lo=t["u_lo"], u_hi=t["u_hi"])) + "\n"); fdone.flush()

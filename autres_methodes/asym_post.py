@@ -89,9 +89,11 @@ def _un(row, alarm, AlarmInterrupt, cancel_alarm, cycles, durs):
 
 
 def traiter(lot):
-    """lot : liste de (i1, i2, i3, i4, C).  Renvoie (nzero, nfacto, cycles, durs).
+    """lot : liste de (i1, i2, i3, i4, C).  Renvoie (nzero, nfacto, cycles, durs, duree).
     Un candidat qui leve une erreur est mis dans durs avec la cle 'erreur' au lieu d'arreter tout le calcul."""
     from cysignals.alarm import alarm, AlarmInterrupt, cancel_alarm
+    import time
+    t0 = time.time()
     nzero = nfac = 0; cycles = []; durs = []
     for row in lot:
         try:
@@ -107,4 +109,4 @@ def traiter(lot):
             nzero += 1
         elif r == 1:
             nfac += 1
-    return nzero, nfac, cycles, durs
+    return nzero, nfac, cycles, durs, time.time() - t0
